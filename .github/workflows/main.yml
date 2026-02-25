@@ -9,6 +9,9 @@ on:
 jobs:
   alerta-minuto:
     runs-on: ubuntu-latest
+    env:  # <--- aquí agregas tus variables de entorno
+      TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - name: Chequear repositorio
         uses: actions/checkout@v3

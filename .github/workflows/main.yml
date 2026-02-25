@@ -1,15 +1,14 @@
-name: Alerta cada minuto
+name: Alerta BTC cada minuto
 
-# Esto programa la acción para ejecutarse cada minuto
 on:
   schedule:
-    - cron: '* * * * *'  # cada minuto
-  workflow_dispatch: # permite ejecutar manualmente si quieres
+    - cron: '* * * * *'  # ejecuta cada minuto
+  workflow_dispatch:  # permite ejecutar manualmente
 
 jobs:
   alerta-minuto:
     runs-on: ubuntu-latest
-    env:  # <--- aquí agregas tus variables de entorno
+    env:  # aquí referenciamos los secrets
       TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
@@ -24,5 +23,5 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Ejecutar script de alerta
-        run: python tu_script.py
+      - name: Ejecutar alerta
+        run: python alerta.py

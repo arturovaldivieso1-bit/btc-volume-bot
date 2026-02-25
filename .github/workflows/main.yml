@@ -1,0 +1,25 @@
+name: Alerta cada minuto
+
+# Esto programa la acción para ejecutarse cada minuto
+on:
+  schedule:
+    - cron: '* * * * *'  # cada minuto
+  workflow_dispatch: # permite ejecutar manualmente si quieres
+
+jobs:
+  alerta-minuto:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chequear repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar script de alerta
+        run: python tu_script.py

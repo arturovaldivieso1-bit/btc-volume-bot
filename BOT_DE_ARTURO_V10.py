@@ -5,7 +5,7 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V10.2 iniciado 🚀")
+print("BOT_DE_ARTURO V10.3 iniciado 🚀")
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -194,6 +194,8 @@ def sweep(df, zona):
 
 def breakout(precio, zona):
 
+    global zona_consumida
+
     if zona_consumida:
         return None
 
@@ -237,30 +239,23 @@ def evaluar():
         zona_alertada_proximidad = False
         zona_consumida = False
 
-        tipo_color = "🟢 HIGH" if zona["tipo"]=="HIGH" else "🔴 LOW"
-        sesgo = "🟢 BULLISH" if zona["tipo"]=="HIGH" else "🔴 BEARISH"
+        tipo = "🟢 HIGH" if zona["tipo"]=="HIGH" else "🔴 LOW"
 
-        distancia = abs(precio - zona["centro"])
-        pct = distancia/precio*100
+        centro = int(zona["centro"])
+        zmin = int(zona["min"])
+        zmax = int(zona["max"])
+        precio_i = int(precio)
+
+        distancia = int(abs(precio - zona["centro"]))
 
         enviar(f"""
 💰 RADAR 1
 
-ZONA DE LIQUIDEZ
+Zona liquidez {tipo}
+{centro} ({zmin}-{zmax})
 
-Tipo: {tipo_color}
-
-Zona:
-{round(zona['min'],2)} - {round(zona['max'],2)}
-
-Centro: {round(zona['centro'],2)}
-Toques: {zona['toques']}
-
-Precio actual: {round(precio,2)}
-Distancia: {round(distancia,2)}$ ({round(pct,3)}%)
-
-Sesgo:
-{sesgo}
+Precio actual {precio_i}
+Distancia {distancia}$
 """)
 
 
@@ -273,13 +268,11 @@ Sesgo:
         enviar(f"""
 🧲 RADAR 2
 
-PRECIO CERCA DE LIQUIDEZ
+Precio cerca de liquidez
 
-Zona:
-{round(zona['min'],2)} - {round(zona['max'],2)}
+{int(zona['centro'])} ({int(zona['min'])}-{int(zona['max'])})
 
-Precio actual:
-{round(precio,2)}
+Precio actual {int(precio)}
 """)
 
 
@@ -290,13 +283,10 @@ Precio actual:
         enviar(f"""
 🚨 RADAR 3
 
-SWEEP CONFIRMADO
+Sweep detectado
 
-Liquidez barrida en zona:
-
-{round(zona['min'],2)} - {round(zona['max'],2)}
-
-POSIBLE REVERSIÓN
+Zona {int(zona['centro'])}
+Posible reversión
 """)
 
 
@@ -311,18 +301,13 @@ POSIBLE REVERSIÓN
         enviar(f"""
 📡 RADAR 4
 
-BREAKOUT CONFIRMADO
+Breakout confirmado {direccion}
 
-Liquidez absorbida
+Liquidez del nivel
+{int(zona['centro'])} absorbida
 
-Dirección:
-{direccion}
-
-Zona rota:
-{round(zona['min'],2)} - {round(zona['max'],2)}
-
-Precio actual:
-{round(df_entry['close'].iloc[-1],2)}
+Precio actual
+{int(df_entry['close'].iloc[-1])}
 """)
 
 

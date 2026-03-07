@@ -5,37 +5,34 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V10 iniciado 🚀")
+print("BOT_DE_ARTURO V10.2 iniciado 🚀")
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOL = "BTCUSDT"
 
-INTERVAL_ENTRY = "5m"
 INTERVAL_MACRO = "1h"
+INTERVAL_ENTRY = "5m"
 
 LOOKBACK = 100
 MIN_TOUCHES = 4
 
 CLUSTER_RANGE = 0.002
 PROXIMITY = 0.0015
+ZONA_EQUIVALENTE = 0.001
 
 
-ultimo_radar1 = None
-ultimo_radar2 = None
-ultimo_radar3 = None
-ultimo_radar4 = None
-
-zona_dominante = None
-tipo_zona = None
+zona_actual = None
+zona_alertada_proximidad = False
+zona_consumida = False
 
 
 # =========================
 # TELEGRAM
 # =========================
 
-def enviar_mensaje(msg):
+def enviar(msg):
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
@@ -73,10 +70,10 @@ def obtener_candles(interval, limit=200):
 
 
 # =========================
-# CLUSTER DE PRECIOS
+# CLUSTER
 # =========================
 
-def cluster_precios(lista):
+def cluster(lista):
 
     clusters = []
 
@@ -86,25 +83,24 @@ def cluster_precios(lista):
 
         for c in clusters:
 
-            if abs(p - c["precio"]) / p < CLUSTER_RANGE:
+            if abs(p - c["centro"]) / p < CLUSTER_RANGE:
 
-                c["precios"].append(p)
-                c["precio"] = sum(c["precios"]) / len(c["precios"])
+                c["valores"].append(p)
+                c["centro"] = sum(c["valores"]) / len(c["valores"])
                 agregado = True
                 break
 
         if not agregado:
 
             clusters.append({
-                "precio": p,
-                "precios": [p]
+                "centro": p,
+                "valores": [p]
             })
 
     return clusters
 
 
 # =========================
-# RADAR 1
 # DETECTAR ZONAS
 # =========================
 
@@ -113,29 +109,33 @@ def detectar_zonas(df):
     highs = df["high"].tail(LOOKBACK).tolist()
     lows = df["low"].tail(LOOKBACK).tolist()
 
-    clusters_high = cluster_precios(highs)
-    clusters_low = cluster_precios(lows)
+    clusters_high = cluster(highs)
+    clusters_low = cluster(lows)
 
     zonas = []
 
     for c in clusters_high:
 
-        if len(c["precios"]) >= MIN_TOUCHES:
+        if len(c["valores"]) >= MIN_TOUCHES:
 
             zonas.append({
-                "tipo": "HIGH",
-                "nivel": c["precio"],
-                "toques": len(c["precios"])
+                "tipo":"HIGH",
+                "centro":c["centro"],
+                "max":max(c["valores"]),
+                "min":min(c["valores"]),
+                "toques":len(c["valores"])
             })
 
     for c in clusters_low:
 
-        if len(c["precios"]) >= MIN_TOUCHES:
+        if len(c["valores"]) >= MIN_TOUCHES:
 
             zonas.append({
-                "tipo": "LOW",
-                "nivel": c["precio"],
-                "toques": len(c["precios"])
+                "tipo":"LOW",
+                "centro":c["centro"],
+                "max":max(c["valores"]),
+                "min":min(c["valores"]),
+                "toques":len(c["valores"])
             })
 
     zonas = sorted(zonas, key=lambda x: x["toques"], reverse=True)
@@ -144,11 +144,22 @@ def detectar_zonas(df):
 
 
 # =========================
-# RADAR 3
+# MISMA ZONA
+# =========================
+
+def misma_zona(z1, z2):
+
+    if z1 is None or z2 is None:
+        return False
+
+    return abs(z1["centro"] - z2["centro"]) / z1["centro"] < ZONA_EQUIVALENTE
+
+
+# =========================
 # SWEEP
 # =========================
 
-def detectar_sweep(df, nivel, tipo):
+def sweep(df, zona):
 
     vela = df.iloc[-1]
 
@@ -157,44 +168,43 @@ def detectar_sweep(df, nivel, tipo):
     close = vela["close"]
 
     volumen = vela["volume"]
+    vol_ma = df["volume"].rolling(20).mean().iloc[-1]
 
-    sma_vol = df["volume"].rolling(20).mean().iloc[-1]
+    rechazo = False
 
-    volumen_fuerte = volumen > sma_vol * 1.5
+    if zona["tipo"] == "HIGH":
 
-    rango = high - low
-    cuerpo = abs(close - vela["open"])
+        if high > zona["max"] and close < zona["centro"]:
+            rechazo = True
 
-    rechazo = (rango / cuerpo) > 2 if cuerpo != 0 else False
+    if zona["tipo"] == "LOW":
 
-    if tipo == "HIGH":
+        if low < zona["min"] and close > zona["centro"]:
+            rechazo = True
 
-        if high > nivel and close < nivel and volumen_fuerte and rechazo:
-            return True
-
-    if tipo == "LOW":
-
-        if low < nivel and close > nivel and volumen_fuerte and rechazo:
-            return True
+    if rechazo and volumen > vol_ma * 1.5:
+        return True
 
     return False
 
 
 # =========================
-# RADAR 4
 # BREAKOUT
 # =========================
 
-def detectar_breakout(precio, nivel, tipo):
+def breakout(precio, zona):
 
-    if tipo == "HIGH":
+    if zona_consumida:
+        return None
 
-        if precio > nivel * 1.003:
+    if zona["tipo"] == "HIGH":
+
+        if precio > zona["max"] * 1.003:
             return "UP"
 
-    if tipo == "LOW":
+    if zona["tipo"] == "LOW":
 
-        if precio < nivel * 0.997:
+        if precio < zona["min"] * 0.997:
             return "DOWN"
 
     return None
@@ -206,13 +216,9 @@ def detectar_breakout(precio, nivel, tipo):
 
 def evaluar():
 
-    global zona_dominante
-    global tipo_zona
-
-    global ultimo_radar1
-    global ultimo_radar2
-    global ultimo_radar3
-    global ultimo_radar4
+    global zona_actual
+    global zona_alertada_proximidad
+    global zona_consumida
 
     df_macro = obtener_candles(INTERVAL_MACRO)
 
@@ -223,111 +229,109 @@ def evaluar():
 
     zona = zonas[0]
 
-    nivel = zona["nivel"]
-    tipo = zona["tipo"]
-    toques = zona["toques"]
+    precio = df_macro["close"].iloc[-1]
 
-    precio_actual = df_macro["close"].iloc[-1]
+    if not misma_zona(zona_actual, zona):
 
-    distancia = abs(precio_actual - nivel) / precio_actual
+        zona_actual = zona
+        zona_alertada_proximidad = False
+        zona_consumida = False
 
-    if ultimo_radar1 != nivel:
+        tipo_color = "🟢 HIGH" if zona["tipo"]=="HIGH" else "🔴 LOW"
+        sesgo = "🟢 BULLISH" if zona["tipo"]=="HIGH" else "🔴 BEARISH"
 
-        sesgo = "ALCISTA" if nivel > precio_actual else "BAJISTA"
+        distancia = abs(precio - zona["centro"])
+        pct = distancia/precio*100
 
-        enviar_mensaje(
-f"""💰 RADAR 1
+        enviar(f"""
+💰 RADAR 1
 
-ZONA DE LIQUIDEZ DETECTADA
+ZONA DE LIQUIDEZ
 
-Tipo: {tipo}
-Nivel: {round(nivel,2)}
-Toques: {toques}
+Tipo: {tipo_color}
 
-Sesgo probable: {sesgo}
+Zona:
+{round(zona['min'],2)} - {round(zona['max'],2)}
 
-BTC 1H"""
-        )
+Centro: {round(zona['centro'],2)}
+Toques: {zona['toques']}
 
-        ultimo_radar1 = nivel
+Precio actual: {round(precio,2)}
+Distancia: {round(distancia,2)}$ ({round(pct,3)}%)
 
-        zona_dominante = nivel
-        tipo_zona = tipo
+Sesgo:
+{sesgo}
+""")
 
 
-    if distancia < PROXIMITY:
+    distancia = abs(precio - zona["centro"]) / precio
 
-        if ultimo_radar2 != nivel:
+    if distancia < PROXIMITY and not zona_alertada_proximidad:
 
-            enviar_mensaje(
-f"""🧲 RADAR 2
+        zona_alertada_proximidad = True
+
+        enviar(f"""
+🧲 RADAR 2
 
 PRECIO CERCA DE LIQUIDEZ
 
-Nivel: {round(nivel,2)}
-Precio: {round(precio_actual,2)}
+Zona:
+{round(zona['min'],2)} - {round(zona['max'],2)}
 
-BTC"""
-            )
-
-            ultimo_radar2 = nivel
+Precio actual:
+{round(precio,2)}
+""")
 
 
     df_entry = obtener_candles(INTERVAL_ENTRY)
 
-    if detectar_sweep(df_entry, nivel, tipo):
+    if sweep(df_entry, zona):
 
-        if ultimo_radar3 != df_entry["time"].iloc[-1]:
-
-            enviar_mensaje(
-f"""🚨 RADAR 3
+        enviar(f"""
+🚨 RADAR 3
 
 SWEEP CONFIRMADO
 
-Liquidez barrida: {round(nivel,2)}
+Liquidez barrida en zona:
 
-Rechazo institucional
-POSIBLE REVERSIÓN"""
-            )
+{round(zona['min'],2)} - {round(zona['max'],2)}
 
-            ultimo_radar3 = df_entry["time"].iloc[-1]
+POSIBLE REVERSIÓN
+""")
 
 
-    breakout = detectar_breakout(df_entry["close"].iloc[-1], nivel, tipo)
+    b = breakout(df_entry["close"].iloc[-1], zona)
 
-    if breakout:
+    if b:
 
-        if ultimo_radar4 != df_entry["time"].iloc[-1]:
+        zona_consumida = True
 
-            direccion = "ALCISTA 🚀" if breakout == "UP" else "BAJISTA 📉"
+        direccion = "🟢 BULLISH" if b=="UP" else "🔴 BEARISH"
 
-            enviar_mensaje(
-f"""📡 RADAR 4
+        enviar(f"""
+📡 RADAR 4
 
 BREAKOUT CONFIRMADO
 
 Liquidez absorbida
-Dirección: {direccion}
 
-Nivel: {round(nivel,2)}
-Precio actual: {round(df_entry['close'].iloc[-1],2)}"""
-            )
+Dirección:
+{direccion}
 
-            ultimo_radar4 = df_entry["time"].iloc[-1]
+Zona rota:
+{round(zona['min'],2)} - {round(zona['max'],2)}
 
+Precio actual:
+{round(df_entry['close'].iloc[-1],2)}
+""")
 
-# =========================
-# LOOP
-# =========================
 
 while True:
 
     try:
-
         evaluar()
 
     except Exception as e:
-
-        print("Error:", e)
+        print(e)
 
     time.sleep(60)

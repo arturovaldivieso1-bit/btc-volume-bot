@@ -14,7 +14,7 @@ TF_STRUCTURE="4h"
 TF_LIQUIDITY="1h"
 TF_ENTRY="5m"
 
-LOOKBACK=120
+LOOKBACK=100
 MIN_TOUCHES=4
 
 CLUSTER_RANGE=0.002
@@ -193,12 +193,12 @@ def breakout(price,z):
 
     if z["type"]=="HIGH":
 
-        if price>z["max"]*1.003:
+        if price>z["max"]*1.0015:
             return "UP"
 
     if z["type"]=="LOW":
 
-        if price<z["min"]*0.997:
+        if price<z["min"]*0.9985:
             return "DOWN"
 
     return None
@@ -219,10 +219,21 @@ def evaluate():
 
     score=liquidity_score(z)
 
-    if score<6:
+    # 🔧 Ajuste 1: score mínimo
+    if score<5:
         return
 
     price=df["close"].iloc[-1]
+
+    # 🔧 Ajuste 3: permitir cambio de zona
+    if zona_actual is not None:
+
+        if abs(z["center"]-zona_actual["center"])/z["center"]>0.004:
+
+            zona_actual=None
+            zona_consumida=False
+            zona_proximidad=False
+
 
     if zona_actual is None:
 
@@ -244,6 +255,7 @@ Precio actual {int(price)}
 
 """)
 
+
     df5=candles(TF_ENTRY)
 
     if magnet(df5):
@@ -259,6 +271,7 @@ Objetivo
 {int(z["center"])}
 
 """)
+
 
     dist=abs(price-z["center"])/price
 
@@ -278,6 +291,7 @@ Precio actual {int(price)}
 
 """)
 
+
     if sweep(df5,z):
 
         send(f"""
@@ -291,6 +305,7 @@ Zona {int(z["center"])}
 Posible reversión
 
 """)
+
 
     b=breakout(df5.iloc[-1]["close"],z)
 
@@ -313,6 +328,7 @@ Precio actual
 {int(df5.iloc[-1]["close"])}
 
 """)
+
 
 while True:
 

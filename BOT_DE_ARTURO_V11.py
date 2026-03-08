@@ -3,12 +3,13 @@ import pandas as pd
 import time
 import os
 
+print("BOT_DE_ARTURO V11 iniciado 🚀")
+
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOL="BTCUSDT"
 
-TF_STRUCTURE="4h"
 TF_LIQUIDITY="1h"
 TF_ENTRY="5m"
 
@@ -17,14 +18,14 @@ MIN_TOUCHES=4
 
 CLUSTER_RANGE=0.002
 PROXIMITY=0.0015
-ZONE_EQ=0.001
 
 zona_actual=None
 zona_consumida=False
 zona_proximidad=False
+magnet_enviado=False
 
 last_heartbeat=0
-HEARTBEAT_INTERVAL=21600  # 6 horas
+HEARTBEAT_INTERVAL=21600
 
 
 def send(msg):
@@ -121,8 +122,6 @@ def detect_zones(df):
                 "touches":len(c["values"])
             })
 
-    zones=sorted(zones,key=lambda x:x["touches"],reverse=True)
-
     return zones
 
 
@@ -159,11 +158,7 @@ def magnet(df):
     v2=df.iloc[-2]["volume"]
     v3=df.iloc[-3]["volume"]
 
-    if r1<r2<r3 and v1<v2<v3:
-
-        return True
-
-    return False
+    return r1<r2<r3 and v1<v2<v3
 
 
 def sweep(df,z):
@@ -207,7 +202,7 @@ def breakout(price,z):
 
 def evaluate():
 
-    global zona_actual,zona_consumida,zona_proximidad,last_heartbeat
+    global zona_actual,zona_consumida,zona_proximidad,magnet_enviado,last_heartbeat
 
     df=candles(TF_LIQUIDITY)
 
@@ -218,7 +213,8 @@ def evaluate():
 
     price=df["close"].iloc[-1]
 
-    # HEARTBEAT
+    zones=sorted(zones,key=lambda z:abs(z["center"]-price))
+
     now=time.time()
 
     if now-last_heartbeat>HEARTBEAT_INTERVAL:
@@ -241,7 +237,6 @@ Zona principal:
         last_heartbeat=now
 
 
-    # evaluar top 2 zonas
     for z in zones[:2]:
 
         score=liquidity_score(z)
@@ -269,20 +264,6 @@ Precio actual {int(price)}
 """)
 
 
-        df5=candles(TF_ENTRY)
-
-        if magnet(df5):
-
-            send(f"""
-📡 RADAR 5
-
-Liquidity magnet detectado
-
-Objetivo
-{int(z['center'])}
-""")
-
-
         dist=abs(price-z["center"])/price
 
         if dist<PROXIMITY and not zona_proximidad:
@@ -301,6 +282,22 @@ Precio actual
 """)
 
 
+        df5=candles(TF_ENTRY)
+
+        if magnet(df5) and not magnet_enviado:
+
+            magnet_enviado=True
+
+            send(f"""
+📡 RADAR 5
+
+Liquidity magnet detectado
+
+Objetivo
+{int(z['center'])}
+""")
+
+
         if sweep(df5,z):
 
             send(f"""
@@ -310,8 +307,6 @@ Sweep detectado
 
 Zona
 {int(z['center'])}
-
-Posible reversión
 """)
 
 

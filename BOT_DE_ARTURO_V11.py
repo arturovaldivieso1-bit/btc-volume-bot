@@ -3,10 +3,10 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V11 iniciado 🚀")
+print("BOT_DE_ARTURO V11.3 iniciado 🚀")
 
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TOKEN=os.getenv("TOKEN")
+CHAT_ID=os.getenv("CHAT_ID")
 
 SYMBOL="BTCUSDT"
 
@@ -19,13 +19,14 @@ MIN_TOUCHES=4
 CLUSTER_RANGE=0.002
 PROXIMITY=0.0015
 
-zona_actual=None
-zona_consumida=False
-zona_proximidad=False
-magnet_enviado=False
-
 last_heartbeat=0
 HEARTBEAT_INTERVAL=21600
+
+zonas_reportadas=set()
+zonas_proximidad=set()
+zonas_sweep=set()
+zonas_break=set()
+zonas_magnet=set()
 
 
 def send(msg):
@@ -71,7 +72,7 @@ def cluster(prices):
 
         for c in clusters:
 
-            if abs(p-c["center"])/p < CLUSTER_RANGE:
+            if abs(p-c["center"])/p<CLUSTER_RANGE:
 
                 c["values"].append(p)
                 c["center"]=sum(c["values"])/len(c["values"])
@@ -185,24 +186,9 @@ def sweep(df,z):
     return False
 
 
-def breakout(price,z):
-
-    if z["type"]=="HIGH":
-
-        if price>z["max"]*1.0015:
-            return "UP"
-
-    if z["type"]=="LOW":
-
-        if price<z["min"]*0.9985:
-            return "DOWN"
-
-    return None
-
-
 def evaluate():
 
-    global zona_actual,zona_consumida,zona_proximidad,magnet_enviado,last_heartbeat
+    global last_heartbeat
 
     df=candles(TF_LIQUIDITY)
 
@@ -224,18 +210,20 @@ def evaluate():
 
 Par: {SYMBOL}
 
-Precio actual:
+Precio actual
 {int(price)}
 
-Zonas detectadas:
+Zonas detectadas
 {len(zones)}
 
-Zona principal:
+Zona más cercana
 {int(zones[0]['center'])}
 """)
 
         last_heartbeat=now
 
+
+    df5=candles(TF_ENTRY)
 
     for z in zones[:2]:
 
@@ -244,90 +232,109 @@ Zona principal:
         if score<4:
             continue
 
+        level=int(z["center"])
 
-        if zona_actual is None:
+        dist=abs(price-z["center"])/price*100
 
-            zona_actual=z
+        direction="ALCISTA" if z["type"]=="HIGH" else "BAJISTA"
 
-            t="🟢 HIGH" if z["type"]=="HIGH" else "🔴 LOW"
+
+        if level not in zonas_reportadas:
+
+            zonas_reportadas.add(level)
 
             send(f"""
 💰 RADAR 1
 
-Zona liquidez {t}
+Liquidez detectada {direction}
 
-{int(z['center'])} ({int(z['min'])}-{int(z['max'])})
-
-Score {score}
-
-Precio actual {int(price)}
-""")
-
-
-        dist=abs(price-z["center"])/price
-
-        if dist<PROXIMITY and not zona_proximidad:
-
-            zona_proximidad=True
-
-            send(f"""
-🧲 RADAR 2
-
-Precio cerca de liquidez
-
+Zona
 {int(z['center'])}
+
+Rango
+{int(z['min'])}-{int(z['max'])}
+
+Score
+{score}
 
 Precio actual
 {int(price)}
 """)
 
 
-        df5=candles(TF_ENTRY)
+        if magnet(df5) and level not in zonas_magnet:
 
-        if magnet(df5) and not magnet_enviado:
-
-            magnet_enviado=True
+            zonas_magnet.add(level)
 
             send(f"""
 📡 RADAR 5
 
-Liquidity magnet detectado
+Liquidity magnet
 
 Objetivo
-{int(z['center'])}
+{level}
+
+Distancia
+{dist:.2f} %
+
+Precio actual
+{int(price)}
 """)
 
 
-        if sweep(df5,z):
+        if dist<PROXIMITY*100 and level not in zonas_proximidad:
+
+            zonas_proximidad.add(level)
+
+            send(f"""
+🧲 RADAR 2
+
+Precio acercándose a liquidez {direction}
+
+Zona
+{level}
+
+Distancia
+{dist:.2f} %
+
+Precio actual
+{int(price)}
+""")
+
+
+        if sweep(df5,z) and level not in zonas_sweep:
+
+            zonas_sweep.add(level)
 
             send(f"""
 🚨 RADAR 3
 
 Sweep detectado
 
-Zona
-{int(z['center'])}
+Zona barrida
+{level}
+
+Precio actual
+{int(price)}
+
+Posible reversión
 """)
 
 
-        b=breakout(df5.iloc[-1]["close"],z)
+        if z["type"]=="LOW" and price<z["min"] and level not in zonas_break:
 
-        if b and not zona_consumida:
-
-            zona_consumida=True
-
-            d="🟢 BULLISH" if b=="UP" else "🔴 BEARISH"
+            zonas_break.add(level)
 
             send(f"""
 📡 RADAR 4
 
-Breakout confirmado {d}
+Breakout BEARISH confirmado
 
-Liquidez del nivel
-{int(z['center'])} absorbida
+Liquidez absorbida
+{level}
 
 Precio actual
-{int(df5.iloc[-1]['close'])}
+{int(price)}
 """)
 
 

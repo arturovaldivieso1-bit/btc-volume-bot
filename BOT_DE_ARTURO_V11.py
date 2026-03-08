@@ -21,6 +21,9 @@ CLUSTER_RANGE=0.002
 PROXIMITY=0.0015
 ZONE_EQ=0.001
 
+
+
+
 zona_actual=None
 zona_consumida=False
 zona_proximidad=False
@@ -211,6 +214,7 @@ def evaluate():
     df=candles(TF_LIQUIDITY)
 
     zones=detect_zones(df)
+    print("Zonas detectadas:", zones[:3])   # ← agregar aquí
 
     if not zones:
         return

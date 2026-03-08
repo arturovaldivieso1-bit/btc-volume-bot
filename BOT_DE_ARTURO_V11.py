@@ -3,6 +3,8 @@ import pandas as pd
 import time
 import os
 
+print("BOT_DE_ARTURO V11 iniciado 🚀")
+
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 

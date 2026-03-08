@@ -3,8 +3,6 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V11 iniciado 🚀")
-
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -21,12 +19,12 @@ CLUSTER_RANGE=0.002
 PROXIMITY=0.0015
 ZONE_EQ=0.001
 
-
-
-
 zona_actual=None
 zona_consumida=False
 zona_proximidad=False
+
+last_heartbeat=0
+HEARTBEAT_INTERVAL=21600  # 6 horas
 
 
 def send(msg):
@@ -209,128 +207,132 @@ def breakout(price,z):
 
 def evaluate():
 
-    global zona_actual,zona_consumida,zona_proximidad
+    global zona_actual,zona_consumida,zona_proximidad,last_heartbeat
 
     df=candles(TF_LIQUIDITY)
 
     zones=detect_zones(df)
-    print("Zonas detectadas:", zones[:3])   # ← agregar aquí
 
     if not zones:
         return
 
-    z=zones[0]
-
-    score=liquidity_score(z)
-
-    # 🔧 Ajuste 1: score mínimo
-    if score<5:
-        return
-
     price=df["close"].iloc[-1]
 
-    # 🔧 Ajuste 3: permitir cambio de zona
-    if zona_actual is not None:
+    # HEARTBEAT
+    now=time.time()
 
-        if abs(z["center"]-zona_actual["center"])/z["center"]>0.004:
-
-            zona_actual=None
-            zona_consumida=False
-            zona_proximidad=False
-
-
-    if zona_actual is None:
-
-        zona_actual=z
-
-        t="🟢 HIGH" if z["type"]=="HIGH" else "🔴 LOW"
+    if now-last_heartbeat>HEARTBEAT_INTERVAL:
 
         send(f"""
+🫀 BOT_DE_ARTURO activo
 
+Par: {SYMBOL}
+
+Precio actual:
+{int(price)}
+
+Zonas detectadas:
+{len(zones)}
+
+Zona principal:
+{int(zones[0]['center'])}
+""")
+
+        last_heartbeat=now
+
+
+    # evaluar top 2 zonas
+    for z in zones[:2]:
+
+        score=liquidity_score(z)
+
+        if score<4:
+            continue
+
+
+        if zona_actual is None:
+
+            zona_actual=z
+
+            t="🟢 HIGH" if z["type"]=="HIGH" else "🔴 LOW"
+
+            send(f"""
 💰 RADAR 1
 
 Zona liquidez {t}
 
-{int(z["center"])} ({int(z["min"])}-{int(z["max"])})
+{int(z['center'])} ({int(z['min'])}-{int(z['max'])})
 
 Score {score}
 
 Precio actual {int(price)}
-
 """)
 
 
-    df5=candles(TF_ENTRY)
+        df5=candles(TF_ENTRY)
 
-    if magnet(df5):
+        if magnet(df5):
 
-        send(f"""
-
+            send(f"""
 📡 RADAR 5
 
 Liquidity magnet detectado
 
 Objetivo
-
-{int(z["center"])}
-
+{int(z['center'])}
 """)
 
 
-    dist=abs(price-z["center"])/price
+        dist=abs(price-z["center"])/price
 
-    if dist<PROXIMITY and not zona_proximidad:
+        if dist<PROXIMITY and not zona_proximidad:
 
-        zona_proximidad=True
+            zona_proximidad=True
 
-        send(f"""
-
+            send(f"""
 🧲 RADAR 2
 
 Precio cerca de liquidez
 
-{int(z["center"])} ({int(z["min"])}-{int(z["max"])})
+{int(z['center'])}
 
-Precio actual {int(price)}
-
+Precio actual
+{int(price)}
 """)
 
 
-    if sweep(df5,z):
+        if sweep(df5,z):
 
-        send(f"""
-
+            send(f"""
 🚨 RADAR 3
 
 Sweep detectado
 
-Zona {int(z["center"])}
+Zona
+{int(z['center'])}
 
 Posible reversión
-
 """)
 
 
-    b=breakout(df5.iloc[-1]["close"],z)
+        b=breakout(df5.iloc[-1]["close"],z)
 
-    if b and not zona_consumida:
+        if b and not zona_consumida:
 
-        zona_consumida=True
+            zona_consumida=True
 
-        d="🟢 BULLISH" if b=="UP" else "🔴 BEARISH"
+            d="🟢 BULLISH" if b=="UP" else "🔴 BEARISH"
 
-        send(f"""
-
+            send(f"""
 📡 RADAR 4
 
 Breakout confirmado {d}
 
 Liquidez del nivel
-{int(z["center"])} absorbida
+{int(z['center'])} absorbida
 
 Precio actual
-{int(df5.iloc[-1]["close"])}
-
+{int(df5.iloc[-1]['close'])}
 """)
 
 

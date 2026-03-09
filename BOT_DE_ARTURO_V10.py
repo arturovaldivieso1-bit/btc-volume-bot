@@ -215,7 +215,7 @@ Zonas detectadas
 
         print("Zona:",int(z["center"]),"Score:",score,"Touches:",z["touches"])
 
-        if score<4:
+        if score<3:
             continue
 
         level=int(z["center"])

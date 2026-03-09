@@ -4,6 +4,7 @@ import time
 import os
 
 print("BOT_DE_ARTURO V10.1 iniciado 🚀")
+print("Zona:", int(z["center"]), "Score:", score)
 
 #acá mejoramos duplicados de alertas para el mismo cluster de liqduiez, dejamos solamente los 4 radares, mejoramos el score, dejamos la misma simbología.
 
@@ -233,7 +234,7 @@ Zonas detectadas
             zonas_r1.add(level)
 
             send(f"""
-            print("Zona:", int(z["center"]), "Score:", score)
+            
 💰 RADAR 1
 
 Liquidez detectada {side}

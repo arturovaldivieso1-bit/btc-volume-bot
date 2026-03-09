@@ -4,7 +4,6 @@ import time
 import os
 
 print("BOT_DE_ARTURO V10.1 iniciado 🚀")
-print("Zona:", int(z["center"]), "Score:", score)
 
 #acá mejoramos duplicados de alertas para el mismo cluster de liqduiez, dejamos solamente los 4 radares, mejoramos el score, dejamos la misma simbología.
 
@@ -215,6 +214,8 @@ Zonas detectadas
     for z in zones[:2]:
 
         score=liquidity_score(z)
+
+         print("Zona:", int(z["center"]), "Score:", score, "Touches:", z["touches"]) #este lo comentamos dps
 
         if score<3:
             continue

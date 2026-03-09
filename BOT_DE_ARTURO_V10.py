@@ -215,7 +215,7 @@ Zonas detectadas
 
         score=liquidity_score(z)
 
-        if score<4:
+        if score<3:
             continue
 
         level=int(z["center"])
@@ -233,6 +233,7 @@ Zonas detectadas
             zonas_r1.add(level)
 
             send(f"""
+            print("Zona:", int(z["center"]), "Score:", score)
 💰 RADAR 1
 
 Liquidez detectada {side}

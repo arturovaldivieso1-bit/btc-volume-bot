@@ -19,7 +19,7 @@ MIN_TOUCHES=4
 CLUSTER_RANGE=0.0015
 PROXIMITY=0.0015
 
-MICRO_ZONE_FILTER=0.001   # evita micro zonas (0.1%)
+MICRO_ZONE_FILTER=0.004   # evita micro zonas (0.1%)  #200-400 usd el rango
 
 HEARTBEAT_INTERVAL=21600
 last_heartbeat=0

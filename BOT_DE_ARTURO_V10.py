@@ -213,13 +213,13 @@ Zonas detectadas
 
     for z in zones[:2]:
 
-        score=liquidity_score(z)
+    score=liquidity_score(z)
 
-         print("Zona:", int(z["center"]), "Score:", score, "Touches:", z["touches"])
+    print("Zona:", int(z["center"]), "Score:", score, "Touches:", z["touches"])
 
-        if score<3:
-            continue
-
+    if score<4:
+        continue
+      
         level=int(z["center"])
 
         dist=abs(price-z["center"])/price*100

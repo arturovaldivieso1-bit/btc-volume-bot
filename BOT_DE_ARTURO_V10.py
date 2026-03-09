@@ -215,7 +215,7 @@ Zonas detectadas
 
         score=liquidity_score(z)
 
-         print("Zona:", int(z["center"]), "Score:", score, "Touches:", z["touches"]) #este lo comentamos dps
+         print("Zona:", int(z["center"]), "Score:", score, "Touches:", z["touches"])
 
         if score<3:
             continue

@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V10.1 iniciado 🚀")
+print("BOT_DE_ARTURO V10.2 iniciado 🚀")
 
 TOKEN=os.getenv("TOKEN")
 CHAT_ID=os.getenv("CHAT_ID")
@@ -19,6 +19,8 @@ MIN_TOUCHES=4
 CLUSTER_RANGE=0.0015
 PROXIMITY=0.0015
 
+MICRO_ZONE_FILTER=0.001   # evita micro zonas (0.1%)
+
 HEARTBEAT_INTERVAL=21600
 last_heartbeat=0
 
@@ -27,6 +29,12 @@ zonas_r2=set()
 zonas_r3=set()
 zonas_r4=set()
 
+zona_activa=None
+
+
+# =========================
+# TELEGRAM
+# =========================
 
 def send(msg):
 
@@ -37,6 +45,10 @@ def send(msg):
         "text":msg
     })
 
+
+# =========================
+# DATOS
+# =========================
 
 def candles(interval,limit=200):
 
@@ -60,6 +72,10 @@ def candles(interval,limit=200):
 
     return df
 
+
+# =========================
+# CLUSTER
+# =========================
 
 def cluster(prices):
 
@@ -87,6 +103,10 @@ def cluster(prices):
 
     return clusters
 
+
+# =========================
+# DETECTAR ZONAS
+# =========================
 
 def detect_zones(df):
 
@@ -122,8 +142,31 @@ def detect_zones(df):
                 "touches":len(c["values"])
             })
 
-    return zones
+    # ordenar por fuerza
+    zones=sorted(zones,key=lambda z:z["touches"],reverse=True)
 
+    # filtro anti micro-zonas
+    filtered=[]
+
+    for z in zones:
+
+        keep=True
+
+        for f in filtered:
+
+            if abs(z["center"]-f["center"])/z["center"] < MICRO_ZONE_FILTER:
+                keep=False
+                break
+
+        if keep:
+            filtered.append(z)
+
+    return filtered
+
+
+# =========================
+# SCORE
+# =========================
 
 def liquidity_score(z):
 
@@ -147,6 +190,10 @@ def liquidity_score(z):
 
     return score
 
+
+# =========================
+# SWEEP
+# =========================
 
 def sweep(df,z):
 
@@ -172,9 +219,14 @@ def sweep(df,z):
     return False
 
 
+# =========================
+# EVALUAR
+# =========================
+
 def evaluate():
 
     global last_heartbeat
+    global zona_activa
 
     df=candles(TF_LIQUIDITY)
 
@@ -184,8 +236,6 @@ def evaluate():
         return
 
     price=df["close"].iloc[-1]
-
-    zones=sorted(zones,key=lambda z:abs(z["center"]-price))
 
     now=time.time()
 
@@ -206,33 +256,43 @@ Zonas detectadas
         last_heartbeat=now
 
 
+    # seleccionar zona activa si no existe
+    if zona_activa is None:
+
+        for z in zones:
+
+            score=liquidity_score(z)
+
+            if score>=3:
+                zona_activa=z
+                break
+
+
+    if zona_activa is None:
+        return
+
+
+    z=zona_activa
+
+    score=liquidity_score(z)
+
+    level=int(z["center"])
+
     df5=candles(TF_ENTRY)
     close5=df5.iloc[-1]["close"]
 
-    for z in zones[:2]:
+    dist=abs(price-z["center"])/price*100
 
-        score=liquidity_score(z)
-
-        print("Zona:",int(z["center"]),"Score:",score,"Touches:",z["touches"])
-
-        if score<3:
-            continue
-
-        level=int(z["center"])
-
-        dist=abs(price-z["center"])/price*100
-
-        if price<z["center"]:
-            side="🟢 HIGH"
-        else:
-            side="🔴 LOW"
+    side="🟢 HIGH" if price<z["center"] else "🔴 LOW"
 
 
-        if level not in zonas_r1:
+    # RADAR 1
 
-            zonas_r1.add(level)
+    if level not in zonas_r1:
 
-            send(f"""
+        zonas_r1.add(level)
+
+        send(f"""
 💰 RADAR 1
 
 Liquidez detectada {side}
@@ -251,11 +311,13 @@ Precio actual
 """)
 
 
-        if dist<PROXIMITY*100 and level not in zonas_r2:
+    # RADAR 2
 
-            zonas_r2.add(level)
+    if dist<PROXIMITY*100 and level not in zonas_r2:
 
-            send(f"""
+        zonas_r2.add(level)
+
+        send(f"""
 🔎 RADAR 2
 
 Precio acercándose a liquidez {side}
@@ -271,11 +333,13 @@ Precio actual
 """)
 
 
-        if sweep(df5,z) and level not in zonas_r3:
+    # RADAR 3
 
-            zonas_r3.add(level)
+    if sweep(df5,z) and level not in zonas_r3:
 
-            send(f"""
+        zonas_r3.add(level)
+
+        send(f"""
 🔄 RADAR 3
 
 Sweep detectado {side}
@@ -290,11 +354,13 @@ Posible reversión
 """)
 
 
-        if z["type"]=="LOW" and close5<z["min"] and level not in zonas_r4:
+    # RADAR 4
 
-            zonas_r4.add(level)
+    if z["type"]=="LOW" and close5<z["min"] and level not in zonas_r4:
 
-            send(f"""
+        zonas_r4.add(level)
+
+        send(f"""
 💥 RADAR 4
 
 Breakout confirmado 🔴 LOW
@@ -306,12 +372,14 @@ Precio actual
 {int(price)}
 """)
 
+        zona_activa=None
 
-        if z["type"]=="HIGH" and close5>z["max"] and level not in zonas_r4:
 
-            zonas_r4.add(level)
+    if z["type"]=="HIGH" and close5>z["max"] and level not in zonas_r4:
 
-            send(f"""
+        zonas_r4.add(level)
+
+        send(f"""
 💥 RADAR 4
 
 Breakout confirmado 🟢 HIGH
@@ -323,6 +391,12 @@ Precio actual
 {int(price)}
 """)
 
+        zona_activa=None
+
+
+# =========================
+# LOOP
+# =========================
 
 while True:
 

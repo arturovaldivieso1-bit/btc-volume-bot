@@ -4,7 +4,7 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V11 (Liquidez Micro Pro) iniciado 🚀")
+print("BOT_DE_ARTURO V11 (Liquidez Micro Pro - sin numpy) iniciado 🚀")
 
 # =========================
 # CONFIG (variables de entorno)
@@ -19,11 +19,11 @@ INTERVAL_ENTRY = "5m"       # Para entradas y radar 0
 
 LOOKBACK = 100
 MIN_TOUCHES = 3             # REDUCIDO: más sensible (antes 4)
-CLUSTER_RANGE = 0.002       # 0.2% para agrupar (se mantiene)
+CLUSTER_RANGE = 0.002       # 0.2% para agrupar
 PROXIMITY = 0.0025          # AUMENTADO: radar 2 avisa antes (0.25%)
 ZONA_EQUIVALENTE = 0.001    # Para evitar duplicados
 
-HEARTBEAT_INTERVAL = 21600  # 6 horas (lo añadimos)
+HEARTBEAT_INTERVAL = 21600  # 6 horas
 
 # Variables globales
 zona_actual = None
@@ -148,7 +148,7 @@ def misma_zona(z1, z2):
     return abs(z1["centro"] - z2["centro"]) / z1["centro"] < ZONA_EQUIVALENTE
 
 # =========================
-# SWEEP (mejorado con mecha y volumen)
+# SWEEP (mejorado con mecha y volumen - SIN NUMPY)
 # =========================
 def sweep(df, zona):
     vela = df.iloc[-1]
@@ -157,8 +157,14 @@ def sweep(df, zona):
     close = vela["close"]
     open_ = vela["open"]
     volumen = vela["volume"]
-    vol_ma = df["volume"].rolling(20).mean().iloc[-1]
-
+    
+    # Calcular media móvil de volumen manualmente (sin numpy)
+    ventana = 20
+    if len(df) >= ventana:
+        vol_ma = df["volume"].iloc[-ventana:].mean()
+    else:
+        vol_ma = volumen  # Si no hay suficientes datos, usamos el actual
+    
     # Detectar mecha larga (cuerpo < 40% del rango)
     rango = high - low
     cuerpo = abs(close - open_)
@@ -166,7 +172,7 @@ def sweep(df, zona):
 
     if zona["tipo"] == "HIGH":
         if high > zona["max"] and close < zona["centro"] and mecha_larga:
-            if volumen > vol_ma * 1.3:  # Volumen algo mayor
+            if volumen > vol_ma * 1.3:
                 return True
     if zona["tipo"] == "LOW":
         if low < zona["min"] and close > zona["centro"] and mecha_larga:
@@ -183,7 +189,7 @@ def breakout(precio, zona):
         return None
 
     if zona["tipo"] == "HIGH":
-        if precio > zona["max"]:  # Sin margen extra, justo al romper
+        if precio > zona["max"]:
             return "🟢 ALCISTA"
     if zona["tipo"] == "LOW":
         if precio < zona["min"]:
@@ -284,7 +290,7 @@ Distancia: {distancia_rel*100:.2f}%
 Precio macro: {int(precio_macro)}
 """)
 
-    # 5. RADAR 3 – Sweep (mejorado)
+    # 5. RADAR 3 – Sweep (mejorado, sin numpy)
     if sweep(df_entry, zona):
         enviar(f"""
 🚨 RADAR 3 – SWEEP DETECTADO

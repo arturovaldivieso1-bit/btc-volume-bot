@@ -3,20 +3,20 @@ import pandas as pd
 import time
 import numpy as np
 
-print("BOT_DE_ARTURO V12 (optimizado 5m) iniciado 🚀")
+print("BOT_DE_ARTURO V11.5 (liquidez optimizada) iniciado 🚀")
 
 # =========================
-# CONFIG
+# CONFIG - IGUAL QUE V11
 # =========================
 
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-LIMIT = 500  # más velas para mejor detección
+LIMIT = 200  # VOLVEMOS A 200 (estable)
 
 TELEGRAM_TOKEN = "TU_TOKEN"
 TELEGRAM_CHAT_ID = "TU_CHAT_ID"
 
-MICRO_ZONE_FILTER = 0.005  # aumentado a 0.5%
+MICRO_ZONE_FILTER = 0.004  # Mantenemos el filtro original
 
 HEARTBEAT_INTERVAL = 14400
 ultimo_heartbeat = time.time()
@@ -28,12 +28,13 @@ radar2_enviado = set()
 radar3_enviado = set()
 radar4_enviado = set()
 
-# Contador para recalcular zonas cada cierto tiempo
-contador_zonas = 0
-RECALCULAR_ZONAS_CADA = 10  # ~ cada 5 minutos (10 ciclos de 30s)
+# Cache simple para zonas (mejora rendimiento sin complicar)
+ultimas_zonas = []
+ultimo_calculo_zonas = 0
+CACHE_ZONAS_SEGUNDOS = 300  # Recalcular cada 5 minutos
 
 # =========================
-# TELEGRAM (sin cambios)
+# TELEGRAM (igual)
 # =========================
 
 def enviar_telegram(msg):
@@ -45,66 +46,41 @@ def enviar_telegram(msg):
         print("Error enviando mensaje Telegram")
 
 # =========================
-# HEARTBEAT (sin cambios)
+# HEARTBEAT (igual)
 # =========================
 
 def heartbeat():
     global ultimo_heartbeat
     ahora = time.time()
     if ahora - ultimo_heartbeat > HEARTBEAT_INTERVAL:
-        enviar_telegram("💓 HEARTBEAT\n\nBOT_DE_ARTURO V12 sigue activo\nMonitoreando BTCUSDT")
+        enviar_telegram("💓 HEARTBEAT\n\nBOT_DE_ARTURO V11.5 sigue activo\nMonitoreando BTCUSDT")
         ultimo_heartbeat = ahora
 
 # =========================
-# DATA (sin cambios)
+# DATA - IGUAL QUE V11 (robusta)
 # =========================
 
 def get_data():
     url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": INTERVAL, "limit": LIMIT}
-    data = requests.get(url, params=params, timeout=10).json()
-    df = pd.DataFrame(data, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","qav","trades","tbbav","tbqav","ignore"
-    ])
-    df = df.astype(float)
-    return df
-
-# =========================
-# NUEVO: OBTENER DATOS 1h (para filtro macro)
-# =========================
-
-def get_data_1h():
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": "1h", "limit": 50}
-    data = requests.get(url, params=params, timeout=10).json()
-    df = pd.DataFrame(data, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","qav","trades","tbbav","tbqav","ignore"
-    ])
-    df = df.astype(float)
-    return df
-
-def tendencia_1h():
-    """Devuelve 'ALCISTA', 'BAJISTA' o 'NEUTRAL' según media móvil de 20 periodos"""
+    params = {
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "limit": LIMIT
+    }
     try:
-        df = get_data_1h()
-        if len(df) < 20:
-            return "NEUTRAL"
-        df['sma20'] = df['close'].rolling(20).mean()
-        ultimo = df.iloc[-1]
-        previo = df.iloc[-2]
-        if ultimo['close'] > ultimo['sma20'] and ultimo['close'] > previo['close']:
-            return "ALCISTA"
-        elif ultimo['close'] < ultimo['sma20'] and ultimo['close'] < previo['close']:
-            return "BAJISTA"
-        else:
-            return "NEUTRAL"
-    except:
-        return "NEUTRAL"
+        data = requests.get(url, params=params, timeout=10).json()
+        df = pd.DataFrame(data, columns=[
+            "timestamp","open","high","low","close","volume",
+            "close_time","qav","trades","tbbav","tbqav","ignore"
+        ])
+        df = df.astype(float)
+        return df
+    except Exception as e:
+        print(f"Error obteniendo datos: {e}")
+        return None
 
 # =========================
-# RADAR 0 (impulso) - umbrales reducidos para mayor sensibilidad
+# RADAR 0 (IMPULSO) - IGUAL
 # =========================
 
 def radar0_impulso(df):
@@ -119,15 +95,14 @@ def radar0_impulso(df):
     high_rango = prev["high"].max()
     low_rango = prev["low"].min()
 
-    # Umbrales reducidos: 1.5x en lugar de 1.8x, 1.4x en lugar de 1.7x
     impulso_alcista = (
-        vela_actual > vela_prom * 1.5 and
-        vol_actual > vol_prom * 1.4 and
+        vela_actual > vela_prom * 1.8 and
+        vol_actual > vol_prom * 1.7 and
         last["close"] > high_rango
     )
     impulso_bajista = (
-        vela_actual > vela_prom * 1.5 and
-        vol_actual > vol_prom * 1.4 and
+        vela_actual > vela_prom * 1.8 and
+        vol_actual > vol_prom * 1.7 and
         last["close"] < low_rango
     )
     if impulso_alcista:
@@ -137,17 +112,20 @@ def radar0_impulso(df):
     return None
 
 # =========================
-# DETECTAR ZONAS - con menos toques requeridos (3) y filtro ampliado
+# DETECTAR ZONAS - MEJORADA (más rápida)
 # =========================
 
 def detect_zones(df):
+    # Usar numpy para operaciones más rápidas
     highs = df["high"].values
     lows = df["low"].values
     zones = []
-    for i in range(len(df)-5):
+    
+    # Muestreo: solo revisar cada 3 velas para ser más rápido
+    for i in range(0, len(df)-5, 3):
         h = highs[i]
         touches = ((abs(highs - h) / h) < MICRO_ZONE_FILTER).sum()
-        if touches >= 3:  # reducido de 4 a 3
+        if touches >= 4:
             zones.append({
                 "type": "HIGH",
                 "center": h,
@@ -157,7 +135,7 @@ def detect_zones(df):
             })
         l = lows[i]
         touches = ((abs(lows - l) / l) < MICRO_ZONE_FILTER).sum()
-        if touches >= 3:
+        if touches >= 4:
             zones.append({
                 "type": "LOW",
                 "center": l,
@@ -165,64 +143,56 @@ def detect_zones(df):
                 "min": l * (1 - MICRO_ZONE_FILTER),
                 "max": l * (1 + MICRO_ZONE_FILTER)
             })
-    # Eliminar duplicados cercanos y ordenar por toques
+    
+    # Eliminar duplicados y ordenar
     zones = sorted(zones, key=lambda z: z["touches"], reverse=True)
-    # Fusión simple: si dos zonas del mismo tipo están muy cerca, quedarse con la de más toques
-    zonas_filtradas = []
+    
+    # Fusión rápida de zonas cercanas
+    zonas_unicas = []
     for z in zones:
-        if not any(abs(z["center"] - zf["center"]) / zf["center"] < MICRO_ZONE_FILTER * 2 for zf in zonas_filtradas):
-            zonas_filtradas.append(z)
-    return zonas_filtradas
+        if not any(abs(z["center"] - zf["center"]) / zf["center"] < MICRO_ZONE_FILTER * 2 
+                   for zf in zonas_unicas):
+            zonas_unicas.append(z)
+    
+    return zonas_unicas[:5]  # Solo las 5 mejores zonas
 
 # =========================
-# SCORE (sin cambios)
+# SCORE (igual)
 # =========================
 
 def liquidity_score(z):
     score = 0
-    if z["touches"] >= 3:
+    if z["touches"] >= 4:
         score += 1
-    if z["touches"] >= 5:
+    if z["touches"] >= 6:
         score += 1
-    if z["touches"] >= 7:
+    if z["touches"] >= 8:
         score += 1
     return score
 
 # =========================
-# EVALUAR ZONA - con filtro macro y radares mejorados
+# EVALUAR ZONA - IGUAL pero más ligera
 # =========================
 
 def evaluate(df):
-    global zona_activa, contador_zonas
-
+    global zona_activa, ultimas_zonas, ultimo_calculo_zonas
+    
     close = df.iloc[-1]["close"]
     high = df.iloc[-1]["high"]
     low = df.iloc[-1]["low"]
-    open_ = df.iloc[-1]["open"]
-
-    # Recalcular zonas cada cierto tiempo
-    if contador_zonas % RECALCULAR_ZONAS_CADA == 0:
-        zonas = detect_zones(df)
-        # Si no hay zona activa, elegir una con score >=1 y que coincida con tendencia macro
-        if zona_activa is None:
-            tend = tendencia_1h()
-            for z in zonas:
-                score = liquidity_score(z)
-                if score >= 1:
-                    # Filtro macro: si tendencia alcista, priorizar zonas HIGH; si bajista, LOW
-                    if tend == "ALCISTA" and z["type"] == "HIGH":
-                        zona_activa = z
-                        break
-                    elif tend == "BAJISTA" and z["type"] == "LOW":
-                        zona_activa = z
-                        break
-                    elif tend == "NEUTRAL":
-                        zona_activa = z
-                        break
-            # Si no se encontró con filtro, tomar la primera con score
-            if zona_activa is None and zonas:
-                zona_activa = zonas[0]
-    contador_zonas += 1
+    
+    # Recalcular zonas solo cada cierto tiempo
+    ahora = time.time()
+    if ahora - ultimo_calculo_zonas > CACHE_ZONAS_SEGUNDOS or zona_activa is None:
+        ultimas_zonas = detect_zones(df)
+        ultimo_calculo_zonas = ahora
+        
+        # Seleccionar nueva zona si no hay activa
+        if zona_activa is None and ultimas_zonas:
+            for z in ultimas_zonas:
+                if liquidity_score(z) >= 1:
+                    zona_activa = z
+                    break
 
     if zona_activa is None:
         return
@@ -230,7 +200,7 @@ def evaluate(df):
     z = zona_activa
     level = round(z["center"], 2)
 
-    # RADAR 1 (detección de zona)
+    # RADAR 1
     if level not in radar1_enviado:
         radar1_enviado.add(level)
         enviar_telegram(
@@ -245,8 +215,8 @@ Toques: {z['touches']}
 
     dist = abs(close - z["center"]) / z["center"]
 
-    # RADAR 2 (acercamiento) - umbral aumentado a 0.3%
-    if dist < 0.003 and level not in radar2_enviado:
+    # RADAR 2 - más sensible (0.25%)
+    if dist < 0.0025 and level not in radar2_enviado:
         radar2_enviado.add(level)
         enviar_telegram(
 f"""🔎 RADAR 2
@@ -258,40 +228,37 @@ Distancia: {round(dist*100, 3)}%
 """
         )
 
-    # RADAR 3 (sweep) - versión mejorada
-    # Se activa si la vela toca la zona y tiene una mecha significativa (cuerpo < 50% del rango)
+    # RADAR 3 - más reactivo
     rango_vela = high - low
-    if rango_vela == 0:
-        cuerpo_pct = 0
-    else:
-        cuerpo_pct = abs(close - open_) / rango_vela
+    cuerpo = abs(df.iloc[-1]["close"] - df.iloc[-1]["open"])
+    cuerpo_pct = cuerpo / rango_vela if rango_vela > 0 else 1
 
     if z["type"] == "HIGH":
-        if high > z["max"] and cuerpo_pct < 0.5 and level not in radar3_enviado:
+        if high > z["max"] and cuerpo_pct < 0.6 and level not in radar3_enviado:
             radar3_enviado.add(level)
             enviar_telegram(
 f"""🔄 RADAR 3
 
-Sweep de liquidez arriba (intrabarra)
+Sweep de liquidez arriba
 
 Zona: {level}
 Posible reversión
 """
             )
     elif z["type"] == "LOW":
-        if low < z["min"] and cuerpo_pct < 0.5 and level not in radar3_enviado:
+        if low < z["min"] and cuerpo_pct < 0.6 and level not in radar3_enviado:
             radar3_enviado.add(level)
             enviar_telegram(
 f"""🔄 RADAR 3
 
-Sweep de liquidez abajo (intrabarra)
+Sweep de liquidez abajo
 
 Zona: {level}
 Posible reversión
 """
             )
 
-    # RADAR 4 (breakout) - confirmación al cierre, pero con ventana para no desactivar inmediatamente
+    # RADAR 4 - BREAKOUT
     if z["type"] == "HIGH":
         if close > z["max"] and level not in radar4_enviado:
             radar4_enviado.add(level)
@@ -303,7 +270,7 @@ Breakout alcista
 Zona rota: {level}
 """
             )
-            # No desactivamos zona aún, esperamos 3 velas para confirmar
+            zona_activa = None  # Zona agotada
     elif z["type"] == "LOW":
         if close < z["min"] and level not in radar4_enviado:
             radar4_enviado.add(level)
@@ -315,19 +282,19 @@ Breakout bajista
 Zona rota: {level}
 """
             )
-
-    # Desactivar zona solo si el precio se aleja claramente (ej. 3 velas por encima/ debajo)
-    # Para simplificar, lo haremos con un contador de velas fuera de zona (no implementado aquí)
-    # Podríamos añadir un contador 'velas_fuera' en zona_activa y desactivar tras 3.
-    # Por ahora, lo dejamos como estaba: se desactiva tras breakout y se reinicia con nueva zona.
+            zona_activa = None  # Zona agotada
 
 # =========================
-# LOOP PRINCIPAL - con ciclo de 30s
+# LOOP PRINCIPAL - 60s (como antes)
 # =========================
 
 while True:
     try:
         df = get_data()
+        if df is None:
+            time.sleep(60)
+            continue
+            
         impulso = radar0_impulso(df)
         if impulso:
             candle_time = df.iloc[-1]["timestamp"]
@@ -344,8 +311,11 @@ Impulso: {impulso}
 Volumen alto detectado
 """
                 )
+        
         evaluate(df)
         heartbeat()
+        
     except Exception as e:
-        print("error:", e)
-    time.sleep(30)  # reducido de 60 a 30 segundos
+        print(f"error en loop: {e}")
+    
+    time.sleep(60)  # Volvemos a 60 segundos

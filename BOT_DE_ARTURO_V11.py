@@ -68,7 +68,7 @@ Radar 3 → Sweep
 Radar 4 → Breakout
 
 Heartbeat activo
-Cada 6 horas
+Cada 4 horas
 """)
 
 

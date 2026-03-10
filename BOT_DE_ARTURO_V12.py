@@ -7,8 +7,12 @@ import os
 from datetime import datetime, timedelta
 
 # ================================
-# CONFIG
+# TELEGRAM ENV VARIABLES
 # ================================
+
+TELEGRAM_TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
 
 SYMBOL = "BTC/USDT"
 TF_EVENT = "5m"
@@ -19,9 +23,6 @@ LIQ_TOLERANCE = 0.002
 
 IMPULSE_MULT = 1.6
 VOL_MULT = 1.3
-
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
 
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6

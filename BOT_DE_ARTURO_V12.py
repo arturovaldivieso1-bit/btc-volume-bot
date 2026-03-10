@@ -7,12 +7,10 @@ import os
 from datetime import datetime, timedelta
 
 # ================================
-# TELEGRAM ENV VARIABLES
+# CONFIG
 # ================================
 
-TELEGRAM_TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
+print("BOT_DE_ARTURO V12 corriendo 🚀")
 
 SYMBOL = "BTC/USDT"
 TF_EVENT = "5m"
@@ -24,15 +22,27 @@ LIQ_TOLERANCE = 0.002
 IMPULSE_MULT = 1.6
 VOL_MULT = 1.3
 
+# CONFIG (variables de entorno)
+# =========================
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
+
+# ================================
+# FORMATO NUMEROS ALERTAS
+# ================================
+
+def fmt(x):
+    return f"{int(round(x)):,}"
 
 # ================================
 # TELEGRAM
 # ================================
 
 def send(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # ================================
@@ -173,10 +183,10 @@ Activo: BTCUSDT
 TF estructura: 1H
 TF eventos: 5m
 
-Precio actual: {round(price,2)}
+Precio actual: {fmt(price)}
 
-🟢 Liquidez arriba: {round(above[0]['price'],2)} | {above[0]['touches']} toques
-🔴 Liquidez abajo: {round(below[0]['price'],2)} | {below[0]['touches']} toques
+🟢 Liquidez arriba: {fmt(above[0]['price'])} | {above[0]['touches']} toques
+🔴 Liquidez abajo: {fmt(below[0]['price'])} | {below[0]['touches']} toques
 """
 
     send(msg)
@@ -214,10 +224,10 @@ while True:
             msg = f"""
 ⚡ IMPULSO ALCISTA DETECTADO
 
-Precio: {round(price,2)}
+Precio: {fmt(price)}
 
-🟢 Liquidez arriba: {round(liq_above[0]['price'],2)}
-🔴 Liquidez abajo: {round(liq_below[0]['price'],2)}
+🟢 Liquidez arriba: {fmt(liq_above[0]['price'])}
+🔴 Liquidez abajo: {fmt(liq_below[0]['price'])}
 """
             send(msg)
             last_event = datetime.now()
@@ -227,7 +237,7 @@ Precio: {round(price,2)}
             msg = f"""
 🚨 SWEEP DE LIQUIDEZ ARRIBA DETECTADO
 
-Precio: {round(price,2)}
+Precio: {fmt(price)}
 
 Dirección probable: 🔻 bajista
 """
@@ -239,7 +249,7 @@ Dirección probable: 🔻 bajista
             msg = f"""
 📡 BREAKOUT ALCISTA CONFIRMADO
 
-Precio: {round(price,2)}
+Precio: {fmt(price)}
 """
             send(msg)
             last_event = datetime.now()
@@ -250,7 +260,7 @@ Precio: {round(price,2)}
 
         if datetime.now() - last_heartbeat > timedelta(hours=HEARTBEAT_HOURS):
 
-            send(f"💓 HEARTBEAT BOT ACTIVO\nPrecio BTC: {round(price,2)}")
+            send(f"💓 HEARTBEAT BOT ACTIVO\nPrecio BTC: {fmt(price)}")
             last_heartbeat = datetime.now()
 
         # =====================

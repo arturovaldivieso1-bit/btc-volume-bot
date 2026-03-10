@@ -17,6 +17,9 @@ TELEGRAM_CHAT_ID = "TU_CHAT_ID"
 
 MICRO_ZONE_FILTER = 0.004
 
+HEARTBEAT_INTERVAL = 14400  # 4 horas
+ultimo_heartbeat = time.time()
+
 zona_activa = None
 
 radar0_enviado=set()
@@ -38,7 +41,32 @@ def enviar_telegram(msg):
         "text":msg
     }
 
-    requests.post(url,data=payload)
+    try:
+        requests.post(url,data=payload,timeout=10)
+    except:
+        print("Error enviando mensaje Telegram")
+
+# =========================
+# HEARTBEAT
+# =========================
+
+def heartbeat():
+
+    global ultimo_heartbeat
+
+    ahora=time.time()
+
+    if ahora-ultimo_heartbeat > HEARTBEAT_INTERVAL:
+
+        enviar_telegram(
+"""💓 HEARTBEAT
+
+BOT_DE_ARTURO V11 sigue activo
+Monitoreando BTCUSDT
+"""
+        )
+
+        ultimo_heartbeat=ahora
 
 # =========================
 # DATA
@@ -54,7 +82,7 @@ def get_data():
         "limit":LIMIT
     }
 
-    data=requests.get(url,params=params).json()
+    data=requests.get(url,params=params,timeout=10).json()
 
     df=pd.DataFrame(data,columns=[
         "timestamp","open","high","low","close","volume",
@@ -171,7 +199,7 @@ def liquidity_score(z):
     return score
 
 # =========================
-# EVALUAR
+# EVALUAR ZONA
 # =========================
 
 def evaluate(df):
@@ -237,7 +265,7 @@ Distancia: {round(dist*100,3)}%
     high=df.iloc[-1]["high"]
     low=df.iloc[-1]["low"]
 
-    # RADAR 3 (SWEEP)
+    # RADAR 3 SWEEP
 
     if z["type"]=="HIGH":
 
@@ -271,7 +299,7 @@ Posible reversión
 """
             )
 
-    # RADAR 4 (BREAKOUT)
+    # RADAR 4 BREAKOUT
 
     if z["type"]=="HIGH":
 
@@ -308,7 +336,7 @@ Zona rota: {level}
             zona_activa=None
 
 # =========================
-# LOOP
+# LOOP PRINCIPAL
 # =========================
 
 while True:
@@ -316,8 +344,6 @@ while True:
     try:
 
         df=get_data()
-
-        # RADAR 0
 
         impulso=radar0_impulso(df)
 
@@ -343,6 +369,8 @@ Volumen alto detectado
                 )
 
         evaluate(df)
+
+        heartbeat()
 
     except Exception as e:
 

@@ -6,58 +6,90 @@ import numpy as np
 print("BOT_DE_ARTURO V11.5 (liquidez optimizada) iniciado 🚀")
 
 # =========================
-# CONFIG - IGUAL QUE V11
+# CONFIG
 # =========================
 
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-LIMIT = 200  # VOLVEMOS A 200 (estable)
+LIMIT = 200
 
 TELEGRAM_TOKEN = "TU_TOKEN"
 TELEGRAM_CHAT_ID = "TU_CHAT_ID"
 
-MICRO_ZONE_FILTER = 0.004  # Mantenemos el filtro original
+MICRO_ZONE_FILTER = 0.004
 
-HEARTBEAT_INTERVAL = 14400
+HEARTBEAT_INTERVAL = 14400  # 4 horas
 ultimo_heartbeat = time.time()
 
 zona_activa = None
+
 radar0_enviado = set()
 radar1_enviado = set()
 radar2_enviado = set()
 radar3_enviado = set()
 radar4_enviado = set()
 
-# Cache simple para zonas (mejora rendimiento sin complicar)
+# Cache para zonas
 ultimas_zonas = []
 ultimo_calculo_zonas = 0
-CACHE_ZONAS_SEGUNDOS = 300  # Recalcular cada 5 minutos
+CACHE_ZONAS_SEGUNDOS = 300  # 5 minutos
 
 # =========================
-# TELEGRAM (igual)
+# TELEGRAM
 # =========================
 
 def enviar_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
+    }
     try:
         requests.post(url, data=payload, timeout=10)
     except:
         print("Error enviando mensaje Telegram")
 
 # =========================
-# HEARTBEAT (igual)
+# HEARTBEAT
 # =========================
 
 def heartbeat():
     global ultimo_heartbeat
     ahora = time.time()
     if ahora - ultimo_heartbeat > HEARTBEAT_INTERVAL:
-        enviar_telegram("💓 HEARTBEAT\n\nBOT_DE_ARTURO V11.5 sigue activo\nMonitoreando BTCUSDT")
+        enviar_telegram(
+"""💓 HEARTBEAT
+
+BOT_DE_ARTURO V11.5 sigue activo
+Monitoreando BTCUSDT
+"""
+        )
         ultimo_heartbeat = ahora
 
 # =========================
-# DATA - IGUAL QUE V11 (robusta)
+# LOG DE INICIO
+# =========================
+
+# Enviamos mensaje de inicio al arrancar
+try:
+    enviar_telegram(
+"""🤖 BOT_DE_ARTURO V11.5 INICIADO
+
+✅ Versión: 11.5 (liquidez optimizada)
+📊 Símbolo: BTCUSDT
+⏱️ Intervalo: 5m
+🎯 Filtro zonas: 0.4%
+💓 Heartbeat: cada 4h
+
+Sistema operativo y monitoreando...
+"""
+    )
+    print("Mensaje de inicio enviado a Telegram")
+except:
+    print("No se pudo enviar mensaje de inicio (quizás token incorrecto)")
+
+# =========================
+# DATA
 # =========================
 
 def get_data():
@@ -80,7 +112,7 @@ def get_data():
         return None
 
 # =========================
-# RADAR 0 (IMPULSO) - IGUAL
+# RADAR 0 (IMPULSO)
 # =========================
 
 def radar0_impulso(df):
@@ -112,16 +144,15 @@ def radar0_impulso(df):
     return None
 
 # =========================
-# DETECTAR ZONAS - MEJORADA (más rápida)
+# DETECTAR ZONAS (optimizada)
 # =========================
 
 def detect_zones(df):
-    # Usar numpy para operaciones más rápidas
     highs = df["high"].values
     lows = df["low"].values
     zones = []
     
-    # Muestreo: solo revisar cada 3 velas para ser más rápido
+    # Muestreo cada 3 velas para rendimiento
     for i in range(0, len(df)-5, 3):
         h = highs[i]
         touches = ((abs(highs - h) / h) < MICRO_ZONE_FILTER).sum()
@@ -144,20 +175,20 @@ def detect_zones(df):
                 "max": l * (1 + MICRO_ZONE_FILTER)
             })
     
-    # Eliminar duplicados y ordenar
+    # Ordenar por toques
     zones = sorted(zones, key=lambda z: z["touches"], reverse=True)
     
-    # Fusión rápida de zonas cercanas
+    # Eliminar duplicados cercanos
     zonas_unicas = []
     for z in zones:
         if not any(abs(z["center"] - zf["center"]) / zf["center"] < MICRO_ZONE_FILTER * 2 
                    for zf in zonas_unicas):
             zonas_unicas.append(z)
     
-    return zonas_unicas[:5]  # Solo las 5 mejores zonas
+    return zonas_unicas[:5]  # Top 5
 
 # =========================
-# SCORE (igual)
+# SCORE
 # =========================
 
 def liquidity_score(z):
@@ -171,7 +202,7 @@ def liquidity_score(z):
     return score
 
 # =========================
-# EVALUAR ZONA - IGUAL pero más ligera
+# EVALUAR ZONA
 # =========================
 
 def evaluate(df):
@@ -181,7 +212,7 @@ def evaluate(df):
     high = df.iloc[-1]["high"]
     low = df.iloc[-1]["low"]
     
-    # Recalcular zonas solo cada cierto tiempo
+    # Recalcular zonas cada cierto tiempo
     ahora = time.time()
     if ahora - ultimo_calculo_zonas > CACHE_ZONAS_SEGUNDOS or zona_activa is None:
         ultimas_zonas = detect_zones(df)
@@ -215,7 +246,7 @@ Toques: {z['touches']}
 
     dist = abs(close - z["center"]) / z["center"]
 
-    # RADAR 2 - más sensible (0.25%)
+    # RADAR 2 (más sensible: 0.25%)
     if dist < 0.0025 and level not in radar2_enviado:
         radar2_enviado.add(level)
         enviar_telegram(
@@ -228,7 +259,7 @@ Distancia: {round(dist*100, 3)}%
 """
         )
 
-    # RADAR 3 - más reactivo
+    # RADAR 3 (sweep mejorado)
     rango_vela = high - low
     cuerpo = abs(df.iloc[-1]["close"] - df.iloc[-1]["open"])
     cuerpo_pct = cuerpo / rango_vela if rango_vela > 0 else 1
@@ -258,7 +289,7 @@ Posible reversión
 """
             )
 
-    # RADAR 4 - BREAKOUT
+    # RADAR 4 (breakout)
     if z["type"] == "HIGH":
         if close > z["max"] and level not in radar4_enviado:
             radar4_enviado.add(level)
@@ -270,7 +301,7 @@ Breakout alcista
 Zona rota: {level}
 """
             )
-            zona_activa = None  # Zona agotada
+            zona_activa = None
     elif z["type"] == "LOW":
         if close < z["min"] and level not in radar4_enviado:
             radar4_enviado.add(level)
@@ -282,16 +313,20 @@ Breakout bajista
 Zona rota: {level}
 """
             )
-            zona_activa = None  # Zona agotada
+            zona_activa = None
 
 # =========================
-# LOOP PRINCIPAL - 60s (como antes)
+# LOOP PRINCIPAL
 # =========================
+
+print("🚀 BOT iniciado - Esperando 10 segundos antes de comenzar...")
+time.sleep(10)  # Pequeña pausa inicial
 
 while True:
     try:
         df = get_data()
         if df is None:
+            print("No hay datos, esperando 60s...")
             time.sleep(60)
             continue
             
@@ -317,5 +352,6 @@ Volumen alto detectado
         
     except Exception as e:
         print(f"error en loop: {e}")
+        enviar_telegram(f"⚠️ Error en bot: {str(e)[:100]}")
     
-    time.sleep(60)  # Volvemos a 60 segundos
+    time.sleep(60)

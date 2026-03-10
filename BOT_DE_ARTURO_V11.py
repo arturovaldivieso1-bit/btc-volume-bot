@@ -1,12 +1,12 @@
-Ajustee: import requests
+import requests
 import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V10.3 LIQUIDEZ PRO iniciado 🚀")
+print("BOT_DE_ARTURO V11.1 iniciado 🚀")
 
 # =========================
-# CONFIG (desde variables de entorno)
+# CONFIG (variables de entorno)
 # =========================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -16,19 +16,21 @@ TF_LIQUIDITY = "1h"      # Temporalidad para detectar zonas (estable)
 TF_ENTRY = "5m"          # Temporalidad para entradas (rápida)
 
 LOOKBACK = 100           # Ventana para buscar zonas
-MIN_TOUCHES = 3          # REDUCIDO: antes 4, ahora 3 (más sensible)
-CLUSTER_RANGE = 0.002    # AUMENTADO: antes 0.0015, ahora 0.2% (agrupa mejor)
-PROXIMITY = 0.0025       # AUMENTADO: antes 0.0015, ahora 0.25% (avisa antes)
-MICRO_ZONE_FILTER = 0.001 # Se mantiene para evitar ruido
+MIN_TOUCHES = 3          # Más sensible (antes 4)
+CLUSTER_RANGE = 0.002    # Agrupa mejor (0.2%)
+PROXIMITY = 0.0025       # Radar 2 avisa antes (0.25%)
+MICRO_ZONE_FILTER = 0.001 # Elimina micro-zonas
 
 HEARTBEAT_INTERVAL = 21600  # 6 horas
 last_heartbeat = 0
 
-# Sets para evitar duplicados
-zonas_r1 = set()
-zonas_r2 = set()
-zonas_r3 = set()
-zonas_r4 = set()
+# Sets para evitar duplicados en cada radar
+radar0_enviado = set()
+radar1_enviado = set()
+radar2_enviado = set()
+radar3_enviado = set()
+radar4_enviado = set()
+
 zona_activa = None
 
 # =========================
@@ -59,7 +61,39 @@ def candles(interval, limit=200):
         return None
 
 # =========================
-# CLUSTER (igual que V10.2)
+# RADAR 0 (IMPULSO EN 5m)
+# =========================
+def radar0_impulso(df):
+    if len(df) < 30:
+        return None
+    last = df.iloc[-1]
+    prev = df.iloc[-20:-1]  # últimas 19 velas (excluye la actual)
+    vela_actual = abs(last["close"] - last["open"])
+    vela_prom = (prev["high"] - prev["low"]).mean()
+    vol_actual = last["volume"]
+    vol_prom = prev["volume"].mean()
+    high_rango = prev["high"].max()
+    low_rango = prev["low"].min()
+
+    # Umbrales ligeramente reducidos para ser más reactivo en 5m
+    impulso_alcista = (
+        vela_actual > vela_prom * 1.6 and
+        vol_actual > vol_prom * 1.5 and
+        last["close"] > high_rango
+    )
+    impulso_bajista = (
+        vela_actual > vela_prom * 1.6 and
+        vol_actual > vol_prom * 1.5 and
+        last["close"] < low_rango
+    )
+    if impulso_alcista:
+        return "ALCISTA"
+    if impulso_bajista:
+        return "BAJISTA"
+    return None
+
+# =========================
+# CLUSTER (igual)
 # =========================
 def cluster(prices):
     clusters = []
@@ -105,7 +139,6 @@ def detect_zones(df):
                 "touches": len(c["values"])
             })
     
-    # Ordenar por toques
     zones = sorted(zones, key=lambda z: z["touches"], reverse=True)
     
     # Filtro anti micro-zonas
@@ -118,7 +151,6 @@ def detect_zones(df):
                 break
         if keep:
             filtered.append(z)
-    
     return filtered
 
 # =========================
@@ -132,7 +164,6 @@ def liquidity_score(z):
         score += 2
     else:
         score += 1
-    
     spread = (z["max"] - z["min"]) / z["center"]
     if spread < 0.001:
         score += 3
@@ -140,7 +171,6 @@ def liquidity_score(z):
         score += 2
     else:
         score += 1
-    
     return score
 
 # =========================
@@ -155,17 +185,14 @@ def sweep(df5, z):
     vol = v["volume"]
     ma = df5["volume"].rolling(20).mean().iloc[-1]
     
-    # Detectar mecha larga (cuerpo pequeño comparado con rango)
     rango = high - low
     cuerpo = abs(close - open_)
-    mecha_larga = (rango > 0) and (cuerpo / rango < 0.4)  # Cuerpo < 40% del rango
+    mecha_larga = (rango > 0) and (cuerpo / rango < 0.4)  # Cuerpo < 40%
     
     if z["type"] == "HIGH":
-        # Sweep alcista: toca resistencia y cierra debajo, con volumen y mecha
         if high > z["max"] and close < z["center"] and vol > ma * 1.3 and mecha_larga:
             return True
     elif z["type"] == "LOW":
-        # Sweep bajista: toca soporte y cierra arriba, con volumen y mecha
         if low < z["min"] and close > z["center"] and vol > ma * 1.3 and mecha_larga:
             return True
     return False
@@ -181,14 +208,14 @@ def heartbeat(price, num_zonas):
 🫀 HEARTBEAT - BOT ACTIVO
 
 Par: {SYMBOL}
-Precio: {int(price)}
+Precio 1h: {int(price)}
 Zonas detectadas: {num_zonas}
 Próximo heartbeat en 6h
 """)
         last_heartbeat = now
 
 # =========================
-# EVALUAR (versión optimizada)
+# EVALUAR (versión con radar 0)
 # =========================
 def evaluate():
     global zona_activa, last_heartbeat
@@ -198,18 +225,37 @@ def evaluate():
     if df_lq is None:
         return
     zones = detect_zones(df_lq)
-    if not zones:
-        return
-    
     price_1h = df_lq["close"].iloc[-1]
     
     # Heartbeat
     heartbeat(price_1h, len(zones))
     
-    # 2. Seleccionar zona activa si no existe
+    # 2. Obtener datos de 5m (para entradas y radar 0)
+    df_en = candles(TF_ENTRY, limit=50)
+    if df_en is None:
+        return
+    close5 = df_en.iloc[-1]["close"]
+    
+    # --- RADAR 0: impulsos en 5m ---
+    impulso = radar0_impulso(df_en)
+    if impulso:
+        candle_time = df_en.iloc[-1]["timestamp"]
+        if candle_time not in radar0_enviado:
+            radar0_enviado.add(candle_time)
+            delta = close5 - df_en.iloc[-1]["open"]
+            send(f"""
+🚨 RADAR 0 - IMPULSO DETECTADO
+
+Dirección: {impulso}
+Δ precio: {delta:.2f} USD
+Volumen alto en 5m
+Precio actual: {int(close5)}
+""")
+    
+    # 3. Seleccionar zona activa si no existe
     if zona_activa is None:
         for z in zones:
-            if liquidity_score(z) >= 3:  # Solo zonas de alta calidad
+            if liquidity_score(z) >= 3:
                 zona_activa = z
                 break
     
@@ -219,18 +265,12 @@ def evaluate():
     z = zona_activa
     score = liquidity_score(z)
     level = int(z["center"])
-    
-    # 3. Obtener datos de 5m (para entradas)
-    df_en = candles(TF_ENTRY, limit=50)
-    if df_en is None:
-        return
-    close5 = df_en.iloc[-1]["close"]
     dist = abs(price_1h - z["center"]) / price_1h * 100
     side = "🟢 HIGH" if price_1h < z["center"] else "🔴 LOW"
     
-    # ---- RADAR 1: detección inicial ----
-    if level not in zonas_r1:
-        zonas_r1.add(level)
+    # ---- RADAR 1 ----
+    if level not in radar1_enviado:
+        radar1_enviado.add(level)
         send(f"""
 💰 RADAR 1 - Zona de liquidez
 
@@ -242,21 +282,21 @@ Score: {score}
 Precio 1h: {int(price_1h)}
 """)
     
-    # ---- RADAR 2: acercamiento (más sensible) ----
-    if dist < PROXIMITY * 100 and level not in zonas_r2:
-        zonas_r2.add(level)
+    # ---- RADAR 2 ----
+    if dist < PROXIMITY * 100 and level not in radar2_enviado:
+        radar2_enviado.add(level)
         send(f"""
 🔎 RADAR 2 - Acercándose
 
 Tipo: {side}
 Zona: {level}
 Distancia: {dist:.2f}%
-Precio actual 5m: {int(close5)}
+Precio 5m: {int(close5)}
 """)
     
-    # ---- RADAR 3: sweep (más reactivo) ----
-    if sweep(df_en, z) and level not in zonas_r3:
-        zonas_r3.add(level)
+    # ---- RADAR 3 ----
+    if sweep(df_en, z) and level not in radar3_enviado:
+        radar3_enviado.add(level)
         send(f"""
 🔄 RADAR 3 - Sweep detectado
 
@@ -266,9 +306,9 @@ Precio 5m: {int(close5)}
 Posible reversión inminente
 """)
     
-    # ---- RADAR 4: breakout confirmado ----
-    if z["type"] == "LOW" and close5 < z["min"] and level not in zonas_r4:
-        zonas_r4.add(level)
+    # ---- RADAR 4 ----
+    if z["type"] == "LOW" and close5 < z["min"] and level not in radar4_enviado:
+        radar4_enviado.add(level)
         send(f"""
 💥 RADAR 4 - BREAKOUT BAJISTA
 
@@ -276,10 +316,9 @@ Liquidez absorbida (soporte roto)
 Zona: {level}
 Precio 5m: {int(close5)}
 """)
-        zona_activa = None  # Zona agotada
-    
-    elif z["type"] == "HIGH" and close5 > z["max"] and level not in zonas_r4:
-        zonas_r4.add(level)
+        zona_activa = None
+    elif z["type"] == "HIGH" and close5 > z["max"] and level not in radar4_enviado:
+        radar4_enviado.add(level)
         send(f"""
 💥 RADAR 4 - BREAKOUT ALCISTA
 
@@ -294,7 +333,7 @@ Precio 5m: {int(close5)}
 # =========================
 # Mensaje de inicio
 try:
-    send("🤖 BOT_DE_ARTURO V10.3 LIQUIDEZ PRO iniciado correctamente")
+    send("🤖 BOT_DE_ARTURO V10.4 (con Radar 0) iniciado correctamente")
     print("Mensaje de inicio enviado")
 except:
     print("No se pudo enviar mensaje de inicio - revisa TOKEN y CHAT_ID")

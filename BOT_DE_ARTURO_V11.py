@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import os
 
-print("BOT_DE_ARTURO V11 iniciado 🚀")
+print("BOT_DE_ARTURO V11.1 iniciado 🚀")
 
 TOKEN=os.getenv("TOKEN")
 CHAT_ID=os.getenv("CHAT_ID")
@@ -13,13 +13,14 @@ SYMBOL="BTCUSDT"
 TF_LIQUIDITY="1h"
 TF_ENTRY="5m"
 
-LOOKBACK=100
+LOOKBACK=36
 MIN_TOUCHES=4
 
 CLUSTER_RANGE=0.0015
 PROXIMITY=0.0015
 
 MICRO_ZONE_FILTER=0.001
+MAX_ZONE_DISTANCE=0.015
 
 HEARTBEAT_INTERVAL=14400
 last_heartbeat=0
@@ -54,7 +55,7 @@ def send(msg):
 def boot():
 
     send(f"""
-🚀 BOT_DE_ARTURO V11 ONLINE
+🚀 BOT_DE_ARTURO V11.1 ONLINE
 
 Par monitoreado
 {SYMBOL}
@@ -66,6 +67,9 @@ Radar 1 → Liquidez
 Radar 2 → Proximidad
 Radar 3 → Sweep
 Radar 4 → Breakout
+
+Liquidez optimizada
+para detección inmediata
 
 Heartbeat activo
 Cada 4 horas
@@ -292,10 +296,13 @@ def evaluate():
 
     zones=detect_zones(df)
 
+    price=df["close"].iloc[-1]
+
+    # filtro zonas demasiado lejanas
+    zones=[z for z in zones if abs(z["center"]-price)/price < MAX_ZONE_DISTANCE]
+
     if not zones:
         return
-
-    price=df["close"].iloc[-1]
 
     now=time.time()
 

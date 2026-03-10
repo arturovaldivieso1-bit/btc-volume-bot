@@ -1,369 +1,351 @@
 import requests
 import pandas as pd
 import time
-import os
 
 print("BOT_DE_ARTURO V11 iniciado 🚀")
 
-TOKEN=os.getenv("TOKEN")
-CHAT_ID=os.getenv("CHAT_ID")
+# =========================
+# CONFIG
+# =========================
 
-SYMBOL="BTCUSDT"
+SYMBOL = "BTCUSDT"
+INTERVAL = "5m"
+LIMIT = 200
 
-TF_LIQUIDITY="1h"
-TF_ENTRY="5m"
+TELEGRAM_TOKEN = "TU_TOKEN"
+TELEGRAM_CHAT_ID = "TU_CHAT_ID"
 
-LOOKBACK=100
-MIN_TOUCHES=4
+MICRO_ZONE_FILTER = 0.004
 
-CLUSTER_RANGE=0.002
-PROXIMITY=0.0015
+zona_activa = None
 
-HEARTBEAT_INTERVAL=21600
-last_heartbeat=0
+radar0_enviado=set()
+radar1_enviado=set()
+radar2_enviado=set()
+radar3_enviado=set()
+radar4_enviado=set()
 
-zonas_r1=set()
-zonas_r2=set()
-zonas_r3=set()
-zonas_r4=set()
-zonas_r5=set()
+# =========================
+# TELEGRAM
+# =========================
 
+def enviar_telegram(msg):
 
-def send(msg):
+    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    url=f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    requests.post(url,data={
-        "chat_id":CHAT_ID,
+    payload={
+        "chat_id":TELEGRAM_CHAT_ID,
         "text":msg
-    })
+    }
 
+    requests.post(url,data=payload)
 
-def candles(interval,limit=200):
+# =========================
+# DATA
+# =========================
+
+def get_data():
 
     url="https://api.binance.com/api/v3/klines"
 
     params={
         "symbol":SYMBOL,
-        "interval":interval,
-        "limit":limit
+        "interval":INTERVAL,
+        "limit":LIMIT
     }
 
     data=requests.get(url,params=params).json()
 
-    df=pd.DataFrame(data)
-
-    df=df[[1,2,3,4,5]]
-
-    df.columns=["open","high","low","close","volume"]
+    df=pd.DataFrame(data,columns=[
+        "timestamp","open","high","low","close","volume",
+        "close_time","qav","trades","tbbav","tbqav","ignore"
+    ])
 
     df=df.astype(float)
 
     return df
 
+# =========================
+# RADAR 0 (IMPULSO)
+# =========================
 
-def cluster(prices):
+def radar0_impulso(df):
 
-    clusters=[]
+    if len(df)<30:
+        return None
 
-    for p in sorted(prices):
+    last=df.iloc[-1]
+    prev=df.iloc[-20:-1]
 
-        added=False
+    vela_actual=abs(last["close"]-last["open"])
+    vela_prom=(prev["high"]-prev["low"]).mean()
 
-        for c in clusters:
+    vol_actual=last["volume"]
+    vol_prom=prev["volume"].mean()
 
-            if abs(p-c["center"])/p < CLUSTER_RANGE:
+    high_rango=prev["high"].max()
+    low_rango=prev["low"].min()
 
-                c["values"].append(p)
-                c["center"]=sum(c["values"])/len(c["values"])
-                added=True
-                break
+    impulso_alcista=(
+        vela_actual>vela_prom*1.8 and
+        vol_actual>vol_prom*1.7 and
+        last["close"]>high_rango
+    )
 
-        if not added:
+    impulso_bajista=(
+        vela_actual>vela_prom*1.8 and
+        vol_actual>vol_prom*1.7 and
+        last["close"]<low_rango
+    )
 
-            clusters.append({
-                "center":p,
-                "values":[p]
-            })
+    if impulso_alcista:
+        return "ALCISTA"
 
-    return clusters
+    if impulso_bajista:
+        return "BAJISTA"
 
+    return None
+
+# =========================
+# DETECTAR ZONAS
+# =========================
 
 def detect_zones(df):
 
-    highs=df["high"].tail(LOOKBACK).tolist()
-    lows=df["low"].tail(LOOKBACK).tolist()
-
-    ch=cluster(highs)
-    cl=cluster(lows)
+    highs=df["high"]
+    lows=df["low"]
 
     zones=[]
 
-    for c in ch:
+    for i in range(len(df)-5):
 
-        if len(c["values"])>=MIN_TOUCHES:
+        h=highs[i]
+
+        touches=((abs(highs-h)/h)<MICRO_ZONE_FILTER).sum()
+
+        if touches>=4:
 
             zones.append({
                 "type":"HIGH",
-                "center":c["center"],
-                "min":min(c["values"]),
-                "max":max(c["values"]),
-                "touches":len(c["values"])
+                "center":h,
+                "touches":touches,
+                "min":h*(1-MICRO_ZONE_FILTER),
+                "max":h*(1+MICRO_ZONE_FILTER)
             })
 
-    for c in cl:
+        l=lows[i]
 
-        if len(c["values"])>=MIN_TOUCHES:
+        touches=((abs(lows-l)/l)<MICRO_ZONE_FILTER).sum()
+
+        if touches>=4:
 
             zones.append({
                 "type":"LOW",
-                "center":c["center"],
-                "min":min(c["values"]),
-                "max":max(c["values"]),
-                "touches":len(c["values"])
+                "center":l,
+                "touches":touches,
+                "min":l*(1-MICRO_ZONE_FILTER),
+                "max":l*(1+MICRO_ZONE_FILTER)
             })
+
+    zones=sorted(zones,key=lambda z:z["touches"],reverse=True)
 
     return zones
 
+# =========================
+# SCORE
+# =========================
 
 def liquidity_score(z):
 
     score=0
 
-    if z["touches"]>10:
-        score+=3
-    elif z["touches"]>6:
-        score+=2
-    else:
+    if z["touches"]>=4:
         score+=1
 
-    spread=(z["max"]-z["min"])/z["center"]
+    if z["touches"]>=6:
+        score+=1
 
-    if spread<0.001:
-        score+=3
-    elif spread<0.002:
-        score+=2
-    else:
+    if z["touches"]>=8:
         score+=1
 
     return score
 
+# =========================
+# EVALUAR
+# =========================
 
-def magnet(df):
+def evaluate(df):
 
-    r1=df.iloc[-1]["high"]-df.iloc[-1]["low"]
-    r2=df.iloc[-2]["high"]-df.iloc[-2]["low"]
-    r3=df.iloc[-3]["high"]-df.iloc[-3]["low"]
+    global zona_activa
 
-    v1=df.iloc[-1]["volume"]
-    v2=df.iloc[-2]["volume"]
-    v3=df.iloc[-3]["volume"]
-
-    return r1<r2<r3 and v1<v2<v3
-
-
-def sweep(df,z):
-
-    v=df.iloc[-1]
-
-    high=v["high"]
-    low=v["low"]
-    close=v["close"]
-
-    vol=v["volume"]
-    ma=df["volume"].rolling(20).mean().iloc[-1]
-
-    if z["type"]=="HIGH":
-
-        if high>z["max"] and close<z["center"] and vol>ma*1.5:
-            return True
-
-    if z["type"]=="LOW":
-
-        if low<z["min"] and close>z["center"] and vol>ma*1.5:
-            return True
-
-    return False
-
-
-def evaluate():
-
-    global last_heartbeat
-
-    df=candles(TF_LIQUIDITY)
+    close=df.iloc[-1]["close"]
 
     zones=detect_zones(df)
 
-    if not zones:
+    if zona_activa is None:
+
+        for z in zones:
+
+            score=liquidity_score(z)
+
+            if score>=1:
+
+                zona_activa=z
+                break
+
+    if zona_activa is None:
         return
 
-    price=df["close"].iloc[-1]
+    z=zona_activa
 
-    zones=sorted(zones,key=lambda z:abs(z["center"]-price))
+    level=round(z["center"],2)
 
-    now=time.time()
+    # RADAR 1
 
-    if now-last_heartbeat>HEARTBEAT_INTERVAL:
+    if level not in radar1_enviado:
 
-        send(f"""
-🫀 BOT_DE_ARTURO activo
+        radar1_enviado.add(level)
 
-Par {SYMBOL}
+        enviar_telegram(
+f"""💰 RADAR 1
 
-Precio actual
-{int(price)}
+Liquidez detectada
 
-Zonas detectadas
-{len(zones)}
-""")
+Zona: {level}
+Toques: {z['touches']}
+"""
+        )
 
-        last_heartbeat=now
+    dist=abs(close-z["center"])/z["center"]
 
+    # RADAR 2
 
-    df5=candles(TF_ENTRY)
-    close5=df5.iloc[-1]["close"]
+    if dist<0.002 and level not in radar2_enviado:
 
-    for z in zones[:2]:
+        radar2_enviado.add(level)
 
-        score=liquidity_score(z)
+        enviar_telegram(
+f"""🔎 RADAR 2
 
-        if score<4:
-            continue
+Precio acercándose a liquidez
 
-        level=int(z["center"])
+Zona: {level}
+Distancia: {round(dist*100,3)}%
+"""
+        )
 
-        dist=abs(price-z["center"])/price*100
+    high=df.iloc[-1]["high"]
+    low=df.iloc[-1]["low"]
 
-        if price<z["center"]:
-            side="🟢 HIGH"
-        else:
-            side="🔴 LOW"
+    # RADAR 3 (SWEEP)
 
+    if z["type"]=="HIGH":
 
-        if level not in zonas_r1:
+        if high>z["max"] and close<z["center"] and level not in radar3_enviado:
 
-            zonas_r1.add(level)
+            radar3_enviado.add(level)
 
-            send(f"""
-💰 RADAR 1
+            enviar_telegram(
+f"""🔄 RADAR 3
 
-Liquidez detectada {side}
+Sweep de liquidez arriba
 
-Zona
-{level}
-
-Rango
-{int(z['min'])}-{int(z['max'])}
-
-Score
-{score}
-
-Precio actual
-{int(price)}
-""")
-
-
-        if magnet(df5) and level not in zonas_r5:
-
-            zonas_r5.add(level)
-
-            send(f"""
-🧲 RADAR 5
-
-Liquidity magnet {side}
-
-Objetivo
-{level}
-
-Distancia
-{dist:.2f} %
-
-Precio actual
-{int(price)}
-""")
-
-
-        if dist<PROXIMITY*100 and level not in zonas_r2:
-
-            zonas_r2.add(level)
-
-            send(f"""
-🔎 RADAR 2
-
-Precio cerca de liquidez {side}
-
-Zona
-{level}
-
-Distancia
-{dist:.2f} %
-
-Precio actual
-{int(price)}
-""")
-
-
-        if sweep(df5,z) and level not in zonas_r3:
-
-            zonas_r3.add(level)
-
-            send(f"""
-🔄 RADAR 3
-
-Sweep detectado {side}
-
-Zona barrida
-{level}
-
-Precio actual
-{int(price)}
-
+Zona: {level}
 Posible reversión
-""")
+"""
+            )
 
+    if z["type"]=="LOW":
 
-        if z["type"]=="LOW" and close5<z["min"] and level not in zonas_r4:
+        if low<z["min"] and close>z["center"] and level not in radar3_enviado:
 
-            zonas_r4.add(level)
+            radar3_enviado.add(level)
 
-            send(f"""
-💥 RADAR 4
+            enviar_telegram(
+f"""🔄 RADAR 3
 
-Breakout confirmado 🔴 LOW
+Sweep de liquidez abajo
 
-Liquidez absorbida
-{level}
+Zona: {level}
+Posible reversión
+"""
+            )
 
-Precio actual
-{int(price)}
-""")
+    # RADAR 4 (BREAKOUT)
 
+    if z["type"]=="HIGH":
 
-        if z["type"]=="HIGH" and close5>z["max"] and level not in zonas_r4:
+        if close>z["max"] and level not in radar4_enviado:
 
-            zonas_r4.add(level)
+            radar4_enviado.add(level)
 
-            send(f"""
-💥 RADAR 4
+            enviar_telegram(
+f"""💥 RADAR 4
 
-Breakout confirmado 🟢 HIGH
+Breakout alcista
 
-Liquidez absorbida
-{level}
+Zona rota: {level}
+"""
+            )
 
-Precio actual
-{int(price)}
-""")
+            zona_activa=None
 
+    if z["type"]=="LOW":
+
+        if close<z["min"] and level not in radar4_enviado:
+
+            radar4_enviado.add(level)
+
+            enviar_telegram(
+f"""💥 RADAR 4
+
+Breakout bajista
+
+Zona rota: {level}
+"""
+            )
+
+            zona_activa=None
+
+# =========================
+# LOOP
+# =========================
 
 while True:
 
     try:
 
-        evaluate()
+        df=get_data()
+
+        # RADAR 0
+
+        impulso=radar0_impulso(df)
+
+        if impulso:
+
+            candle_time=df.iloc[-1]["timestamp"]
+
+            if candle_time not in radar0_enviado:
+
+                radar0_enviado.add(candle_time)
+
+                delta=df.iloc[-1]["close"]-df.iloc[-1]["open"]
+
+                enviar_telegram(
+f"""🚨 RADAR 0
+
+Mercado despertó
+
+Impulso: {impulso}
+Δ precio: {round(delta,2)} USD
+Volumen alto detectado
+"""
+                )
+
+        evaluate(df)
 
     except Exception as e:
 
-        print(e)
+        print("error:",e)
 
     time.sleep(60)

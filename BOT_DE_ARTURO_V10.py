@@ -41,12 +41,11 @@ last_impulse_time = None
 last_heartbeat_time = None
 last_event_time = None
 last_mapa_time = None
-zona_actual = None
+zona_actual = None           # Almacena (centro_arriba, centro_abajo) o None
 zona_alertada_proximidad = False
 zona_consumida = False
 alerted_liquidity = set()
-sweep_pendiente = None
-
+sweep_pendiente = None       # Guarda (zona, tipo) para confirmar en la siguiente vela
 
 # =========================
 # FUNCIONES AUXILIARES
@@ -157,10 +156,7 @@ def formatear_liquidez(zona, precio, es_arriba=True, incluir_distancia=True):
 def misma_zona(z1, z2):
     if z1 is None or z2 is None:
         return False
-    # Comparamos los centros de las zonas principales (arriba y abajo)
-    # Para simplificar, consideramos que si la primera zona arriba y abajo son similares, es la misma
-    if len(z1) != 2 or len(z2) != 2:
-        return False
+    # z1 y z2 son tuplas (centro_arriba, centro_abajo)
     c1_arriba, c1_abajo = z1
     c2_arriba, c2_abajo = z2
     if c1_arriba is None or c2_arriba is None or c1_abajo is None or c2_abajo is None:
@@ -211,7 +207,6 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo):
     if cerca:
         titulo = f"⚡ IMPULSO {direccion} {cerca.upper()}"
     msg = f"{titulo}\n\nPrecio: {fmt(precio_actual)}\nVolumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)\n"
-    # Solo mostramos la zona más cercana arriba y abajo para no saturar
     if zonas_arriba:
         msg += "\n" + formatear_liquidez(zonas_arriba[0], precio_actual, es_arriba=True)
     if zonas_abajo:
@@ -225,8 +220,10 @@ def radar_sweep(df_entry, zonas_arriba, zonas_abajo, precio_actual):
     if df_entry.empty or len(df_entry) < 2:
         return
     vela_actual = df_entry.iloc[-1]
+    # Si hay un sweep pendiente de confirmar
     if sweep_pendiente:
         zona, tipo_sweep = sweep_pendiente
+        # Confirmar: vela actual cierra en dirección contraria
         if tipo_sweep == "HIGH" and vela_actual["close"] < vela_actual["open"]:
             direccion = "🔻 BAJISTA"
         elif tipo_sweep == "LOW" and vela_actual["close"] > vela_actual["open"]:
@@ -244,17 +241,18 @@ def radar_sweep(df_entry, zonas_arriba, zonas_abajo, precio_actual):
         last_event_time = datetime.now(UTC)
         sweep_pendiente = None
         return
-    vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-    vela = df_entry.iloc[-2] if len(df_entry) >= 2 else None
-    if vela is None:
+    # Buscar nuevo sweep en la vela anterior (para evitar look-ahead bias)
+    if len(df_entry) < 2:
         return
+    vela_anterior = df_entry.iloc[-2]
+    vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
     for z in zonas_arriba + zonas_abajo:
-        if z["tipo"] == "HIGH" and vela["high"] > z["max"] and vela["close"] < z["centro"]:
-            if vela["volume"] > vol_medio * 1.5:
+        if z["tipo"] == "HIGH" and vela_anterior["high"] > z["max"] and vela_anterior["close"] < z["centro"]:
+            if vela_anterior["volume"] > vol_medio * 1.5:
                 sweep_pendiente = (z, "HIGH")
                 break
-        elif z["tipo"] == "LOW" and vela["low"] < z["min"] and vela["close"] > z["centro"]:
-            if vela["volume"] > vol_medio * 1.5:
+        elif z["tipo"] == "LOW" and vela_anterior["low"] < z["min"] and vela_anterior["close"] > z["centro"]:
+            if vela_anterior["volume"] > vol_medio * 1.5:
                 sweep_pendiente = (z, "LOW")
                 break
 
@@ -264,6 +262,7 @@ def radar_breakout(df_entry, zonas_arriba, zonas_abajo, precio_actual):
         return
     vela = df_entry.iloc[-1]
     close = vela["close"]
+    # Breakout alcista
     for z in zonas_arriba:
         key = ("break", round(z["centro"]))
         if key in alerted_liquidity:
@@ -277,6 +276,7 @@ def radar_breakout(df_entry, zonas_arriba, zonas_abajo, precio_actual):
             enviar(msg)
             last_event_time = datetime.now(UTC)
             break
+    # Breakout bajista
     for z in zonas_abajo:
         key = ("break", round(z["centro"]))
         if key in alerted_liquidity:
@@ -306,28 +306,35 @@ def enviar_mapa_liquidez(zonas_arriba, zonas_abajo, precio, titulo="💰 MAPA DE
 def heartbeat():
     global last_heartbeat_time
     ahora = datetime.now(UTC)
-    if last_heartbeat_time and (ahora - last_heartbeat_time) < timedelta(hours=HEARTBEAT_HOURS):
+    if last_heartbeat_time is None:
+        last_heartbeat_time = ahora
         return
-    precio = obtener_precio_actual() or 0
-    msg = f"💓 HEARTBEAT BOT ACTIVO\nHora UTC: {ahora.strftime('%H:%M')}\nActivo: {SYMBOL}\nPrecio: {fmt(precio)}"
-    enviar(msg)
-    last_heartbeat_time = ahora
+    if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
+        precio = obtener_precio_actual() or 0
+        msg = f"💓 HEARTBEAT BOT ACTIVO\nHora UTC: {ahora.strftime('%H:%M')}\nActivo: {SYMBOL}\nPrecio: {fmt(precio)}"
+        enviar(msg)
+        last_heartbeat_time = ahora
 
 def sin_eventos():
     global last_event_time
     ahora = datetime.now(UTC)
-    if last_event_time and (ahora - last_event_time) > timedelta(hours=NO_EVENT_HOURS):
+    if last_event_time is None:
+        last_event_time = ahora
+        return
+    if (ahora - last_event_time) > timedelta(hours=NO_EVENT_HOURS):
         precio = obtener_precio_actual() or 0
         msg = f"⚠️ MERCADO SIN EVENTOS RELEVANTES\nTiempo sin señales: {NO_EVENT_HOURS}h\nPrecio actual: {fmt(precio)}\nEstado: lateral / baja volatilidad"
         enviar(msg)
         last_event_time = ahora
 
 # =========================
-# FUNCIÓN PRINCIPAL
+# FUNCIÓN PRINCIPAL DE EVALUACIÓN
 # =========================
 
 def evaluar():
     global zona_actual, zona_alertada_proximidad, zona_consumida, alerted_liquidity, last_event_time, last_mapa_time
+
+    ahora = datetime.now(UTC)  # Variable local para cooldowns
 
     df_macro = obtener_candles(INTERVAL_MACRO)
     df_entry = obtener_candles(INTERVAL_ENTRY)
@@ -338,9 +345,10 @@ def evaluar():
     zonas_high, zonas_low = detectar_zonas(df_macro)
     zonas_arriba, zonas_abajo = seleccionar_zonas_relevantes(zonas_high, zonas_low, precio)
 
-    # Determinar zona principal (primeras de cada lado)
-    nueva_zona = (zonas_arriba[0]["centro"] if zonas_arriba else None,
-                  zonas_abajo[0]["centro"] if zonas_abajo else None)
+    # Definir zona actual como tupla (centro arriba principal, centro abajo principal)
+    centro_arriba = zonas_arriba[0]["centro"] if zonas_arriba else None
+    centro_abajo = zonas_abajo[0]["centro"] if zonas_abajo else None
+    nueva_zona = (centro_arriba, centro_abajo)
 
     # Si la zona cambió significativamente y ha pasado el cooldown, enviar mapa
     if not misma_zona(zona_actual, nueva_zona):
@@ -348,13 +356,21 @@ def evaluar():
         zona_alertada_proximidad = False
         zona_consumida = False
         alerted_liquidity.clear()
-        ahora = datetime.now(UTC)
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
             enviar_mapa_liquidez(zonas_arriba, zonas_abajo, precio)
             last_mapa_time = ahora
         last_event_time = ahora
 
-    # Radar 2 - Proximidad (solo una alerta por zona y más compacta)
+    # RADAR 2 - Proximidad (solo una alerta por zona y más compacta)
+    # Reiniciamos la bandera si el precio se aleja de todas las zonas
+    cerca_de_alguna = False
+    for z in zonas_arriba + zonas_abajo:
+        if abs(precio - z["centro"]) / precio < PROXIMITY:
+            cerca_de_alguna = True
+            break
+    if not cerca_de_alguna:
+        zona_alertada_proximidad = False
+
     for z in zonas_arriba + zonas_abajo:
         dist = abs(precio - z["centro"]) / precio
         if dist < PROXIMITY and not zona_alertada_proximidad:
@@ -367,7 +383,7 @@ def evaluar():
                 msg += f"Nivel: {fmt(z['centro'])} ({dist*100:.2f}%) | {z['toques']} toques"
                 if z["toques"] >= 5:
                     msg += " 🔥"
-                # Añadir la zona opuesta más relevante
+                # Añadir la zona opuesta más relevante (sin distancia para no repetir)
                 if tipo == "arriba" and zonas_abajo:
                     msg += "\n\n" + formatear_liquidez(zonas_abajo[0], precio, es_arriba=False, incluir_distancia=False)
                 elif tipo == "abajo" and zonas_arriba:
@@ -377,49 +393,54 @@ def evaluar():
                 zona_alertada_proximidad = True
                 break
 
-    # Radars
+    # RADAR 0 - Impulso
     radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo)
+
+    # RADAR 3 - Sweep con confirmación
     radar_sweep(df_entry, zonas_arriba, zonas_abajo, precio)
+
+    # RADAR 4 - Breakout
     radar_breakout(df_entry, zonas_arriba, zonas_abajo, precio)
 
-    # Sistema
+    # Alertas de sistema
     heartbeat()
     sin_eventos()
 
 # =========================
-# INICIO
+# INICIO DEL BOT
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.4...")
+    print("🚀 Iniciando BOT V10.5...")
     # Alerta de inicio con todo el contexto
     precio_inicial = obtener_precio_actual()
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)
-    if not df_temp.empty:
+    if not df_temp.empty and precio_inicial:
         zh, zl = detectar_zonas(df_temp)
-        za, zb = seleccionar_zonas_relevantes(zh, zl, precio_inicial or 0)
-        msg = f"🟢 BOT STOP HUNT ENGINE V10.4 ONLINE\n"
+        za, zb = seleccionar_zonas_relevantes(zh, zl, precio_inicial)
+        msg = f"🟢 BOT STOP HUNT ENGINE V10.5 ONLINE\n"
         msg += f"Activo: {SYMBOL} | Estructura: {INTERVAL_MACRO} | Eventos: {INTERVAL_ENTRY}\n"
         msg += f"Lookback: {LOOKBACK} velas | Min toques: {MIN_TOUCHES} | Cluster: {CLUSTER_RANGE*100:.2f}%\n\n"
-        msg += f"Precio actual: {fmt(precio_inicial or 0)}\n"
+        msg += f"Precio actual: {fmt(precio_inicial)}\n"
         for z in za:
-            msg += "\n" + formatear_liquidez(z, precio_inicial or 0, es_arriba=True)
+            msg += "\n" + formatear_liquidez(z, precio_inicial, es_arriba=True)
         for z in zb:
-            msg += "\n" + formatear_liquidez(z, precio_inicial or 0, es_arriba=False)
+            msg += "\n" + formatear_liquidez(z, precio_inicial, es_arriba=False)
         enviar(msg)
     else:
-        enviar("🟢 BOT STOP HUNT ENGINE V10.4 ONLINE (sin datos iniciales)")
+        enviar("🟢 BOT STOP HUNT ENGINE V10.5 ONLINE (sin datos iniciales)")
 
     # Inicializar tiempos
     last_heartbeat_time = datetime.now(UTC)
     last_event_time = datetime.now(UTC)
     last_mapa_time = None
 
+    # Bucle principal
     while True:
         try:
             evaluar()
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error en ciclo principal: {e}")
             enviar(f"⚠️ ERROR: {str(e)[:100]}")
             time.sleep(60)
         time.sleep(60)

@@ -25,7 +25,7 @@ last_impulse = None
 last_sweep = None
 last_breakout = None
 
-last_event_time = datetime.now(UTC)          # <-- CORREGIDO: antes era datetime.now(datetime.UTC)
+last_event_time = datetime.now(UTC)
 last_heartbeat = datetime.now(UTC)
 
 alerted_liquidity = set()
@@ -111,7 +111,7 @@ def radar_impulse(df):
 
     if range_val>IMPULSE_RANGE/100 and vol>IMPULSE_VOLUME:
 
-        if last_impulse is None or (datetime.utcnow()-last_impulse).seconds>900:
+        if last_impulse is None or (datetime.now(UTC)-last_impulse).seconds>900:
 
             price=get_price()
 
@@ -125,8 +125,8 @@ Precio: {fmt(price)}
 Movimiento anómalo detectado"""
             )
 
-            last_impulse=datetime.utcnow()
-            last_event_time=datetime.utcnow()
+            last_impulse=datetime.now(UTC)
+            last_event_time=datetime.now(UTC)
 
 
 def radar_approach(price,levels):
@@ -146,7 +146,7 @@ def radar_approach(price,levels):
                 send(
 f"""📡 RADAR 1 — APROXIMACIÓN
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Precio: {fmt(price)}
 Liquidez: {fmt(lvl["price"])}
@@ -155,7 +155,7 @@ Distancia: {fmt(abs(price-lvl["price"]))}"""
                 )
 
                 alerted_liquidity.add(key)
-                last_event_time=datetime.utcnow()
+                last_event_time=datetime.now(UTC)
 
 
 def radar_critical(price,levels):
@@ -175,7 +175,7 @@ def radar_critical(price,levels):
                 send(
 f"""⚠️ RADAR 2 — ZONA CRÍTICA
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Precio: {fmt(price)}
 Liquidez: {fmt(lvl["price"])}
@@ -184,7 +184,7 @@ Barrido probable"""
                 )
 
                 alerted_liquidity.add(key)
-                last_event_time=datetime.utcnow()
+                last_event_time=datetime.now(UTC)
 
 
 def radar_sweep(df,levels):
@@ -204,7 +204,7 @@ def radar_sweep(df,levels):
                 send(
 f"""🚨 RADAR 3 — SWEEP
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Nivel barrido: {fmt(lvl["price"])}
 High sweep: {fmt(candle["high"])}
@@ -215,7 +215,7 @@ Dirección probable: 🔻"""
                 )
 
                 alerted_liquidity.add(key)
-                last_event_time=datetime.utcnow()
+                last_event_time=datetime.now(UTC)
 
 
 def radar_breakout(df,levels):
@@ -235,7 +235,7 @@ def radar_breakout(df,levels):
                 send(
 f"""📡 RADAR 4 — BREAKOUT
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Nivel roto: {fmt(lvl["price"])}
 
@@ -245,7 +245,7 @@ Continuación probable: 🔺"""
                 )
 
                 alerted_liquidity.add(key)
-                last_event_time=datetime.utcnow()
+                last_event_time=datetime.now(UTC)
 
 
 def heartbeat():
@@ -259,31 +259,31 @@ def heartbeat():
         send(
 f"""💓 BOT ACTIVO
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Precio BTC: {fmt(price)}"""
         )
 
-        last_heartbeat=datetime.utcnow()
+        last_heartbeat=datetime.now(UTC)
 
 
 def no_events():
 
     global last_event_time
 
-    if (datetime.utcnow()-last_event_time)>timedelta(hours=NO_EVENT_HOURS):
+    if (datetime.now(UTC)-last_event_time)>timedelta(hours=NO_EVENT_HOURS):
 
         price=get_price()
 
         send(
 f"""🟡 SIN EVENTOS
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Precio BTC: {fmt(price)}"""
         )
 
-        last_event_time=datetime.utcnow()
+        last_event_time=datetime.now(UTC)
 
 
 send("🤖 BOT BTC INICIADO")

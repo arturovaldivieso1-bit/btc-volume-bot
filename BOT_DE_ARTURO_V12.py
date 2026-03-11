@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -25,8 +25,8 @@ last_impulse = None
 last_sweep = None
 last_breakout = None
 
-last_event_time = datetime.utcnow()
-last_heartbeat = datetime.utcnow()
+last_event_time = datetime.now(datetime.UTC)
+last_heartbeat = datetime.now(UTC)
 
 alerted_liquidity = set()
 
@@ -118,7 +118,7 @@ def radar_impulse(df):
             send(
 f"""⚡ RADAR 0 — IMPULSO
 
-Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+Hora UTC: {datetime.now(UTC).strftime("%H:%M")}
 
 Precio: {fmt(price)}
 
@@ -252,7 +252,7 @@ def heartbeat():
 
     global last_heartbeat
 
-    if (datetime.utcnow()-last_heartbeat)>timedelta(hours=HEARTBEAT_HOURS):
+    if (datetime.now(UTC) - last_heartbeat) > timedelta(hours=HEARTBEAT_HOURS):
 
         price=get_price()
 

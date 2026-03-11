@@ -144,12 +144,23 @@ def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
     mejor_abajo = abajo[0] if abajo else None
     return mejor_arriba, mejor_abajo
 
-def formatear_liquidez(zona, precio, es_arriba=True, incluir_distancia=True, mostrar_distancia=True):
+def formatear_liquidez_simple(zona, precio):
+    """Formato para RADAR 1: solo nivel, distancia y toques"""
     if zona is None:
         return ""
-    linea = f"{'🟢' if es_arriba else '🔴'} "
-    linea += f"{'ARRIBA' if es_arriba else 'ABAJO'}: {fmt(zona['centro'])}"
-    if incluir_distancia and mostrar_distancia:
+    dist = abs(zona["centro"] - precio) / precio * 100
+    linea = f"{fmt(zona['centro'])} ({dist:.1f}%) | {zona['toques']} toques"
+    if zona["toques"] >= 5:
+        linea += " 🔥"
+    return linea
+
+def formatear_liquidez_radar2(zona, precio, es_arriba, mostrar_distancia=True):
+    """Formato para RADAR 2: con flecha y distancia opcional"""
+    if zona is None:
+        return ""
+    flecha = "⬆" if es_arriba else "⬇"
+    linea = f"{'🟢' if es_arriba else '🔴'} {flecha} {fmt(zona['centro'])}"
+    if mostrar_distancia:
         dist = abs(zona["centro"] - precio) / precio * 100
         linea += f" ({dist:.1f}%)"
     linea += f" | {zona['toques']} toques"
@@ -172,7 +183,7 @@ def misma_zona(z1, z2):
 # RADARES
 # =========================
 
-def radar_impulse(df_entry, precio_actual, mejor_arriba, mejor_abajo):
+def radar_impulse(df_entry, precio_actual):
     global last_impulse_time, last_event_time
     if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
         return
@@ -199,13 +210,11 @@ def radar_impulse(df_entry, precio_actual, mejor_arriba, mejor_abajo):
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
-    # Título con color
     titulo = f"{emoji} IMPULSO {direccion} DETECTADO"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)}\n"
     msg += f"Volumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)\n"
     msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
-    # No incluimos líneas de liquidez aquí (por petición de Arturo)
     enviar(msg)
     last_impulse_time = ahora
     last_event_time = ahora
@@ -232,11 +241,11 @@ def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
         msg += f"Precio: {fmt(precio_actual)}\n"
         msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
         msg += f"Dirección probable: {emoji} {direccion}\n"
-        # Añadir liquidez opuesta como referencia rápida (opcional, pero puede ser útil)
+        # Mostrar la liquidez opuesta como referencia
         if tipo_sweep == "HIGH" and mejor_abajo:
-            msg += f"\n{formatear_liquidez(mejor_abajo, precio_actual, es_arriba=False, mostrar_distancia=False)}"
+            msg += f"\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, precio_actual, es_arriba=False, mostrar_distancia=False)}"
         elif tipo_sweep == "LOW" and mejor_arriba:
-            msg += f"\n{formatear_liquidez(mejor_arriba, precio_actual, es_arriba=True, mostrar_distancia=False)}"
+            msg += f"\n🔼 Liquidez arriba: {formatear_liquidez_radar2(mejor_arriba, precio_actual, es_arriba=True, mostrar_distancia=False)}"
         enviar(msg)
         last_event_time = ahora
         sweep_pendiente = None
@@ -270,7 +279,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             msg += f"Liquidez arriba consumida: {fmt(mejor_arriba['centro'])}\n"
             msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
             if mejor_abajo:
-                msg += f"\n{formatear_liquidez(mejor_abajo, close, es_arriba=False, mostrar_distancia=False)}"
+                msg += f"\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, close, es_arriba=False, mostrar_distancia=False)}"
             enviar(msg)
             last_event_time = ahora
             return
@@ -285,7 +294,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             msg += f"Liquidez abajo consumida: {fmt(mejor_abajo['centro'])}\n"
             msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
             if mejor_arriba:
-                msg += f"\n{formatear_liquidez(mejor_arriba, close, es_arriba=True, mostrar_distancia=False)}"
+                msg += f"\n🔼 Liquidez arriba: {formatear_liquidez_radar2(mejor_arriba, close, es_arriba=True, mostrar_distancia=False)}"
             enviar(msg)
             last_event_time = ahora
             return
@@ -294,13 +303,18 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
 # ALERTAS DE SISTEMA
 # =========================
 
-def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, titulo="📡 RADAR 1 – LIQUIDEZ DETECTADA"):
-    msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n"
+def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio):
+    """RADAR 1: solo la mejor zona, con título indicando HIGH/LOW"""
     if mejor_arriba:
-        msg += "\n" + formatear_liquidez(mejor_arriba, precio, es_arriba=True)
+        titulo = f"🟢 RADAR 1 – LIQUIDEZ DETECTADA HIGH"
+        nivel = formatear_liquidez_simple(mejor_arriba, precio)
+        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
+        enviar(msg)
     if mejor_abajo:
-        msg += "\n" + formatear_liquidez(mejor_abajo, precio, es_arriba=False)
-    enviar(msg)
+        titulo = f"🔴 RADAR 1 – LIQUIDEZ DETECTADA LOW"
+        nivel = formatear_liquidez_simple(mejor_abajo, precio)
+        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
+        enviar(msg)
 
 def heartbeat():
     global last_heartbeat_time
@@ -310,7 +324,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"💓 HEARTBEAT BOT ACTIVO\nHora UTC: {ahora.strftime('%H:%M')}\nActivo: {SYMBOL}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -349,14 +363,18 @@ def evaluar():
     centro_abajo = mejor_abajo["centro"] if mejor_abajo else None
     nueva_zona = (centro_arriba, centro_abajo)
 
-    # Si cambió la zona significativamente, enviar RADAR 1 (con cooldown)
+    # Si cambió la zona significativamente, enviar RADAR 1 (cada zona por separado, con cooldown)
     if not misma_zona(zona_actual, nueva_zona):
         zona_actual = nueva_zona
         zona_alertada_proximidad = False
         zona_consumida = False
         alerted_liquidity.clear()
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
-            enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio)
+            # Enviar RADAR 1 para arriba y abajo por separado
+            if mejor_arriba:
+                enviar_liquidez_detectada(mejor_arriba, None, precio)
+            if mejor_abajo:
+                enviar_liquidez_detectada(None, mejor_abajo, precio)
             last_mapa_time = ahora
         last_event_time = ahora
 
@@ -378,7 +396,7 @@ def evaluar():
                 if mejor_arriba["toques"] >= 5:
                     msg += " 🔥"
                 if mejor_abajo:
-                    msg += "\n\n" + formatear_liquidez(mejor_abajo, precio, es_arriba=False, mostrar_distancia=False)
+                    msg += f"\n\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, precio, es_arriba=False, mostrar_distancia=False)}"
                 enviar(msg)
                 last_event_time = ahora
                 zona_alertada_proximidad = True
@@ -393,13 +411,13 @@ def evaluar():
                 if mejor_abajo["toques"] >= 5:
                     msg += " 🔥"
                 if mejor_arriba:
-                    msg += "\n\n" + formatear_liquidez(mejor_arriba, precio, es_arriba=True, mostrar_distancia=False)
+                    msg += f"\n\n🔼 Liquidez arriba: {formatear_liquidez_radar2(mejor_arriba, precio, es_arriba=True, mostrar_distancia=False)}"
                 enviar(msg)
                 last_event_time = ahora
                 zona_alertada_proximidad = True
 
     # RADAR 0
-    radar_impulse(df_entry, precio, mejor_arriba, mejor_abajo)
+    radar_impulse(df_entry, precio)
 
     # RADAR 3
     radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio)
@@ -416,23 +434,22 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.7...")
+    print("🚀 Iniciando BOT V10.8...")
     precio_inicial = obtener_precio_actual()
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)
     if not df_temp.empty and precio_inicial:
         zh, zl = detectar_zonas(df_temp)
         ma, mb = seleccionar_mejores_zonas(zh, zl, precio_inicial)
-        msg = f"🟢 BOT STOP HUNT ENGINE V10.7 ONLINE\n"
-        msg += f"Activo: {SYMBOL} | Estructura: {INTERVAL_MACRO} | Eventos: {INTERVAL_ENTRY}\n"
-        msg += f"Lookback: {LOOKBACK} velas | Min toques: {MIN_TOUCHES} | Cluster: {CLUSTER_RANGE*100:.2f}%\n\n"
-        msg += f"Precio actual: {fmt(precio_inicial)}\n"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO\n"
+        msg += f"Hora UTC: {datetime.now(UTC).strftime('%H:%M')}\n"
+        msg += f"Precio: {fmt(precio_inicial)}\n"
         if ma:
-            msg += "\n" + formatear_liquidez(ma, precio_inicial, es_arriba=True)
+            msg += f"\n🔼 Liquidez arriba: {formatear_liquidez_radar2(ma, precio_inicial, es_arriba=True)}"
         if mb:
-            msg += "\n" + formatear_liquidez(mb, precio_inicial, es_arriba=False)
+            msg += f"\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mb, precio_inicial, es_arriba=False)}"
         enviar(msg)
     else:
-        enviar("🟢 BOT STOP HUNT ENGINE V10.7 ONLINE (sin datos iniciales)")
+        enviar("🤖 BOT DE ARTURO FUNCIONANDO (sin datos iniciales)")
 
     last_heartbeat_time = datetime.now(UTC)
     last_event_time = datetime.now(UTC)

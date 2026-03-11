@@ -241,7 +241,6 @@ def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
         msg += f"Precio: {fmt(precio_actual)}\n"
         msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
         msg += f"Dirección probable: {emoji} {direccion}\n"
-        # Mostrar la liquidez opuesta como referencia
         if tipo_sweep == "HIGH" and mejor_abajo:
             msg += f"\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, precio_actual, es_arriba=False, mostrar_distancia=False)}"
         elif tipo_sweep == "LOW" and mejor_arriba:
@@ -358,19 +357,16 @@ def evaluar():
     zonas_high, zonas_low = detectar_zonas(df_macro)
     mejor_arriba, mejor_abajo = seleccionar_mejores_zonas(zonas_high, zonas_low, precio)
 
-    # Definir zona actual como tupla de centros
     centro_arriba = mejor_arriba["centro"] if mejor_arriba else None
     centro_abajo = mejor_abajo["centro"] if mejor_abajo else None
     nueva_zona = (centro_arriba, centro_abajo)
 
-    # Si cambió la zona significativamente, enviar RADAR 1 (cada zona por separado, con cooldown)
     if not misma_zona(zona_actual, nueva_zona):
         zona_actual = nueva_zona
         zona_alertada_proximidad = False
         zona_consumida = False
         alerted_liquidity.clear()
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
-            # Enviar RADAR 1 para arriba y abajo por separado
             if mejor_arriba:
                 enviar_liquidez_detectada(mejor_arriba, None, precio)
             if mejor_abajo:
@@ -378,7 +374,6 @@ def evaluar():
             last_mapa_time = ahora
         last_event_time = ahora
 
-    # RADAR 2 - Proximidad (solo si no se ha alertado ya y estamos cerca)
     cerca_arriba = mejor_arriba and abs(precio - mejor_arriba["centro"]) / precio < PROXIMITY
     cerca_abajo = mejor_abajo and abs(precio - mejor_abajo["centro"]) / precio < PROXIMITY
     if not (cerca_arriba or cerca_abajo):
@@ -416,16 +411,10 @@ def evaluar():
                 last_event_time = ahora
                 zona_alertada_proximidad = True
 
-    # RADAR 0
     radar_impulse(df_entry, precio)
-
-    # RADAR 3
     radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio)
-
-    # RADAR 4
     radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio)
 
-    # Alertas de sistema
     heartbeat()
     sin_eventos()
 

@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import time
 import os
+from datetime import datetime, timedelta, UTC
 
 print("BOT_DE_ARTURO V10 iniciado 🚀")
 
@@ -11,34 +12,31 @@ print("BOT_DE_ARTURO V10 iniciado 🚀")
 # CONFIGURACIÓN INICIAL (Variables globales ajustables)
 # =========================
 
-# Tokens de Telegram (obtenidos de variables de entorno)
+# Tokens de Telegram (obligatorio configurarlas como variables de entorno)
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # Par de trading
 SYMBOL = "BTCUSDT"
 
-# Intervalos de tiempo para análisis macro (detección de zonas) y entrada (sweep/breakout)
-INTERVAL_MACRO = "1h"      # Temporalidad mayor para identificar zonas de liquidez
-INTERVAL_ENTRY = "5m"      # Temporalidad menor para detectar movimientos finos
+# Intervalos de tiempo
+INTERVAL_MACRO = "1h"      # Temporalidad mayor para detectar zonas de liquidez
+INTERVAL_ENTRY = "5m"      # Temporalidad menor para análisis fino (sweep, breakout, impulsos)
 
-# Número de velas hacia atrás para buscar toques en la zona macro
-LOOKBACK = 100
+# Parámetros para detección de zonas de liquidez (RADAR 1)
+LOOKBACK = 100              # Número de velas hacia atrás para buscar toques
+MIN_TOUCHES = 4             # Mínimo de toques para considerar una zona válida (mayor = más filtro)
+CLUSTER_RANGE = 0.002       # 0.2% - Rango para agrupar precios en un mismo clúster
+PROXIMITY = 0.0015          # 0.15% - Distancia para alertar proximidad a la zona (RADAR 2)
+ZONA_EQUIVALENTE = 0.001    # 0.1% - Tolerancia para considerar dos zonas como la misma
 
-# Mínimo de toques para considerar una zona válida (ajustar: mayor = más filtro)
-MIN_TOUCHES = 4
+# Parámetros para RADAR 0 (detección de impulsos)
+IMPULSE_RANGE = 1.3         # % mínimo de rango de la vela (high-low)/close (ej. 1.3 = 1.3%)
+IMPULSE_VOLUME = 1.1        # Volumen mínimo relativo a la media móvil de 20 (1.1 = 110% del promedio)
+IMPULSE_COOLDOWN = 900      # Segundos entre alertas de impulso (900 = 15 minutos)
 
-# Rango para agrupar precios en un mismo clúster (porcentaje respecto al precio)
-# Ejemplo: 0.002 = 0.2% (más pequeño = zonas más ajustadas)
-CLUSTER_RANGE = 0.002
-
-# Distancia para alertar proximidad a la zona (porcentaje respecto al precio)
-PROXIMITY = 0.0015  # 0.15%
-
-# Rango para considerar dos zonas como la misma (evita duplicados)
-ZONA_EQUIVALENTE = 0.001  # 0.1%
-
-# Variables de estado (no tocar, las usa el bot internamente)
+# Variables de estado internas (no modificar)
+last_impulse_time = None
 zona_actual = None
 zona_alertada_proximidad = False
 zona_consumida = False
@@ -71,16 +69,12 @@ def obtener_candles(interval, limit=200):
         "limit": limit
     }
     data = requests.get(url, params=params).json()
-
     df = pd.DataFrame(data, columns=[
         "time","open","high","low","close","volume",
         "_","_","_","_","_","_"
     ])
-
-    # Convertir a numérico
     for col in ["open","high","low","close","volume"]:
         df[col] = df[col].astype(float)
-
     return df
 
 
@@ -128,12 +122,9 @@ def detectar_zonas(df):
     """
     highs = df["high"].tail(LOOKBACK).tolist()
     lows = df["low"].tail(LOOKBACK).tolist()
-
     clusters_high = cluster(highs)
     clusters_low = cluster(lows)
-
     zonas = []
-
     for c in clusters_high:
         if len(c["valores"]) >= MIN_TOUCHES:
             zonas.append({
@@ -143,7 +134,6 @@ def detectar_zonas(df):
                 "min":min(c["valores"]),
                 "toques":len(c["valores"])
             })
-
     for c in clusters_low:
         if len(c["valores"]) >= MIN_TOUCHES:
             zonas.append({
@@ -153,7 +143,6 @@ def detectar_zonas(df):
                 "min":min(c["valores"]),
                 "toques":len(c["valores"])
             })
-
     zonas = sorted(zonas, key=lambda x: x["toques"], reverse=True)
     return zonas
 
@@ -172,14 +161,46 @@ def misma_zona(z1, z2):
 
 
 # =========================
-# DETECCIÓN DE SWEEP (barrido de liquidez)
+# RADAR 0 - DETECCIÓN DE IMPULSOS
+# =========================
+def radar_impulse(df):
+    """
+    Detecta velas con gran rango y volumen superior al promedio.
+    Utiliza los datos de entrada (INTERVAL_ENTRY) y compara con:
+      - IMPULSE_RANGE: % mínimo de rango (high-low)/close
+      - IMPULSE_VOLUME: relación volumen / media móvil 20
+    Además respeta un cooldown (IMPULSE_COOLDOWN) para no saturar.
+    Ajusta estos valores para hacer el radar más o menos sensible.
+    """
+    global last_impulse_time
+    vela = df.iloc[-1]
+    rango = (vela["high"] - vela["low"]) / vela["close"] * 100  # en porcentaje
+    vol_rel = vela["volume"] / df["volume"].rolling(20).mean().iloc[-1]
+
+    if rango > IMPULSE_RANGE and vol_rel > IMPULSE_VOLUME:
+        ahora = datetime.now(UTC)
+        if last_impulse_time is None or (ahora - last_impulse_time).seconds > IMPULSE_COOLDOWN:
+            precio = vela["close"]
+            enviar(f"""
+⚡ RADAR 0 — IMPULSO DETECTADO
+Hora UTC: {ahora.strftime("%H:%M")}
+Precio: {int(precio)}
+Rango: {rango:.2f}%
+Volumen: {vol_rel:.2f}x media
+Movimiento anómalo en {INTERVAL_ENTRY}
+""")
+            last_impulse_time = ahora
+
+
+# =========================
+# DETECCIÓN DE SWEEP (RADAR 3)
 # =========================
 def sweep(df, zona):
     """
-    Detecta si en la última vela de entrada (entry) se ha barrido la zona:
+    Detecta si en la última vela de entrada se ha barrido la zona:
     - Para zona HIGH: precio supera el máximo y cierra por debajo del centro.
     - Para zona LOW: precio baja del mínimo y cierra por encima del centro.
-    Además, requiere que el volumen sea al menos 1.5 veces el promedio.
+    Requiere que el volumen sea al menos 1.5 veces el promedio.
     Retorna True si hay sweep.
     """
     vela = df.iloc[-1]
@@ -203,7 +224,7 @@ def sweep(df, zona):
 
 
 # =========================
-# DETECCIÓN DE BREAKOUT (ruptura de zona)
+# DETECCIÓN DE BREAKOUT (RADAR 4)
 # =========================
 def breakout(precio, zona):
     """
@@ -232,28 +253,24 @@ def breakout(precio, zona):
 def evaluar():
     """
     Ejecuta el flujo completo del bot en cada ciclo:
-    1. Obtiene datos macro y detecta la zona principal.
-    2. Si la zona cambia, envía RADAR 1 (nueva zona detectada).
-    3. Si el precio está cerca de la zona, envía RADAR 2.
-    4. Si hay sweep en entry, envía RADAR 3.
-    5. Si hay breakout, envía RADAR 4 y marca zona como consumida.
+    1. Obtiene datos macro y detecta la zona principal (RADAR 1 si cambia).
+    2. Si el precio está cerca de la zona, envía RADAR 2.
+    3. Analiza velas de entrada para RADAR 0 (impulsos).
+    4. Detecta sweep (RADAR 3) y breakout (RADAR 4).
     """
     global zona_actual
     global zona_alertada_proximidad
     global zona_consumida
 
-    # Obtener velas macro y detectar zonas
+    # --- Parte macro: detección de zonas ---
     df_macro = obtener_candles(INTERVAL_MACRO)
     zonas = detectar_zonas(df_macro)
-
     if not zonas:
         return
-
-    # Tomar la zona con más toques
     zona = zonas[0]
     precio = df_macro["close"].iloc[-1]
 
-    # Si la zona ha cambiado (no es la misma que antes), reiniciamos estado
+    # Si la zona ha cambiado (nueva zona), reiniciamos estado y enviamos RADAR 1
     if not misma_zona(zona_actual, zona):
         zona_actual = zona
         zona_alertada_proximidad = False
@@ -275,24 +292,25 @@ Precio actual: {precio_i}
 Distancia al centro: {distancia}$
 """)
 
-    # Calcular distancia relativa al centro de la zona
-    distancia = abs(precio - zona["centro"]) / precio
-
-    # Si estamos cerca y no se ha alertado aún, enviar RADAR 2
-    if distancia < PROXIMITY and not zona_alertada_proximidad:
+    # Proximidad a la zona (RADAR 2)
+    distancia_rel = abs(precio - zona["centro"]) / precio
+    if distancia_rel < PROXIMITY and not zona_alertada_proximidad:
         zona_alertada_proximidad = True
         enviar(f"""
 🧲 RADAR 2 - PROXIMIDAD A LIQUIDEZ
 
 Zona: {int(zona['centro'])} ({int(zona['min'])}-{int(zona['max'])})
 Precio actual: {int(precio)}
-Distancia: {distancia*100:.2f}%
+Distancia: {distancia_rel*100:.2f}%
 """)
 
-    # Obtener velas de entrada para análisis fino
+    # --- Parte fina: análisis en intervalo de entrada ---
     df_entry = obtener_candles(INTERVAL_ENTRY)
 
-    # Detectar sweep
+    # RADAR 0 - Impulsos (siempre activo)
+    radar_impulse(df_entry)
+
+    # RADAR 3 - Sweep
     if sweep(df_entry, zona):
         enviar(f"""
 🚨 RADAR 3 - SWEEP DETECTADO
@@ -301,7 +319,7 @@ Zona barrida: {int(zona['centro'])}
 Señal de posible reversión.
 """)
 
-    # Detectar breakout
+    # RADAR 4 - Breakout
     b = breakout(df_entry["close"].iloc[-1], zona)
     if b:
         zona_consumida = True

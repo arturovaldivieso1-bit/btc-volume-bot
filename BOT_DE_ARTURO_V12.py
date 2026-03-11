@@ -38,8 +38,13 @@ def fmt(price):
 # ================================
 
 def send(msg):
+
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+
+    try:
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    except:
+        print("Error enviando mensaje")
 
 # ================================
 # BINANCE
@@ -54,8 +59,14 @@ exchange = ccxt.binance({
 # ================================
 
 def get_ohlc(tf, limit=200):
+
     ohlc = exchange.fetch_ohlcv(SYMBOL, timeframe=tf, limit=limit)
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+
+    df = pd.DataFrame(
+        ohlc,
+        columns=["time","open","high","low","close","volume"]
+    )
+
     return df
 
 # ================================
@@ -67,18 +78,25 @@ def cluster_levels(levels, tolerance):
     clusters = []
 
     for price in levels:
+
         placed = False
 
         for cluster in clusters:
 
             if abs(price - cluster["price"]) / cluster["price"] < tolerance:
+
                 cluster["touches"] += 1
                 cluster["price"] = (cluster["price"] + price) / 2
+
                 placed = True
                 break
 
         if not placed:
-            clusters.append({"price":price,"touches":1})
+
+            clusters.append({
+                "price": price,
+                "touches": 1
+            })
 
     return clusters
 
@@ -97,7 +115,7 @@ def get_liquidity(df, current_price):
     return above, below
 
 # ================================
-# IMPULSE DETECTION (RADAR 0)
+# IMPULSE DETECTION
 # ================================
 
 def detect_impulse(df):
@@ -123,7 +141,7 @@ def detect_impulse(df):
     return None
 
 # ================================
-# SWEEP DETECTION (RADAR 3)
+# SWEEP DETECTION
 # ================================
 
 def detect_sweep(df, liq_above, liq_below):
@@ -136,19 +154,19 @@ def detect_sweep(df, liq_above, liq_below):
         if last["high"] > lvl["price"] and last["close"] < lvl["price"]:
 
             if confirm["close"] < last["close"]:
-                return "sweep_high"
+                return "sweep_high", lvl["price"]
 
     for lvl in liq_below:
 
         if last["low"] < lvl["price"] and last["close"] > lvl["price"]:
 
             if confirm["close"] > last["close"]:
-                return "sweep_low"
+                return "sweep_low", lvl["price"]
 
-    return None
+    return None, None
 
 # ================================
-# BREAKOUT DETECTION (RADAR 4)
+# BREAKOUT DETECTION
 # ================================
 
 def detect_breakout(df, liq_above, liq_below):
@@ -178,8 +196,11 @@ def startup():
 
     above, below = get_liquidity(df, price)
 
+    up = fmt(above[0]["price"]) if above else "N/A"
+    down = fmt(below[0]["price"]) if below else "N/A"
+
     msg = f"""
-🟢 BOT STOP HUNT ENGINE V12.1 ONLINE
+🟢 BOT STOP HUNT ENGINE ONLINE
 
 Activo: BTCUSDT
 TF estructura: 1H
@@ -187,18 +208,25 @@ TF eventos: 5m
 
 Precio actual: {fmt(price)}
 
-🟢 Liquidez arriba: {fmt(above[0]['price'])} | {above[0]['touches']} toques
-🔴 Liquidez abajo: {fmt(below[0]['price'])} | {below[0]['touches']} toques
+🟢 Liquidez arriba: {up}
+🔴 Liquidez abajo: {down}
 """
 
     send(msg)
 
 # ================================
-# MAIN LOOP
+# VARIABLES DE CONTROL
 # ================================
 
 last_heartbeat = datetime.now()
 last_event = datetime.now()
+
+last_candle_time = None
+last_sweep_level = None
+
+# ================================
+# START
+# ================================
 
 startup()
 
@@ -207,6 +235,15 @@ while True:
     try:
 
         df5 = get_ohlc(TF_EVENT, 200)
+
+        current_candle = df5["time"].iloc[-1]
+
+        if current_candle == last_candle_time:
+            time.sleep(20)
+            continue
+
+        last_candle_time = current_candle
+
         df1 = get_ohlc(TF_STRUCTURE, 200)
 
         price = df5["close"].iloc[-1]
@@ -214,11 +251,11 @@ while True:
         liq_above, liq_below = get_liquidity(df1, price)
 
         impulse = detect_impulse(df5)
-        sweep = detect_sweep(df5, liq_above, liq_below)
+        sweep, sweep_level = detect_sweep(df5, liq_above, liq_below)
         breakout = detect_breakout(df5, liq_above, liq_below)
 
         # =====================
-        # EVENTS
+        # IMPULSE
         # =====================
 
         if impulse == "bullish":
@@ -227,24 +264,35 @@ while True:
 ⚡ IMPULSO ALCISTA DETECTADO
 
 Precio: {fmt(price)}
-
-🟢 Liquidez arriba: {fmt(liq_above[0]['price'])}
-🔴 Liquidez abajo: {fmt(liq_below[0]['price'])}
 """
+
             send(msg)
             last_event = datetime.now()
 
+        # =====================
+        # SWEEP
+        # =====================
+
         if sweep == "sweep_high":
 
-            msg = f"""
+            if sweep_level != last_sweep_level:
+
+                msg = f"""
 🚨 SWEEP DE LIQUIDEZ ARRIBA DETECTADO
 
 Precio: {fmt(price)}
 
 Dirección probable: 🔻 bajista
 """
-            send(msg)
-            last_event = datetime.now()
+
+                send(msg)
+
+                last_sweep_level = sweep_level
+                last_event = datetime.now()
+
+        # =====================
+        # BREAKOUT
+        # =====================
 
         if breakout == "breakout_up":
 
@@ -253,6 +301,7 @@ Dirección probable: 🔻 bajista
 
 Precio: {fmt(price)}
 """
+
             send(msg)
             last_event = datetime.now()
 
@@ -262,7 +311,8 @@ Precio: {fmt(price)}
 
         if datetime.now() - last_heartbeat > timedelta(hours=HEARTBEAT_HOURS):
 
-            send(f"💓 HEARTBEAT BOT ACTIVO\nPrecio BTC: {fmt(price)}")
+            send(f"💓 BOT ACTIVO\nPrecio BTC: {fmt(price)}")
+
             last_heartbeat = datetime.now()
 
         # =====================
@@ -272,11 +322,12 @@ Precio: {fmt(price)}
         if datetime.now() - last_event > timedelta(hours=NO_EVENT_HOURS):
 
             send("⚠️ MERCADO SIN EVENTOS RELEVANTES (6H)")
+
             last_event = datetime.now()
 
-        time.sleep(60)
+        time.sleep(30)
 
     except Exception as e:
 
-        send(f"♻️ ERROR DETECTADO: {str(e)}\nIntentando reconectar...")
-        time.sleep(30)
+        send(f"⚠️ ERROR BOT: {str(e)}")
+        time.sleep(60)

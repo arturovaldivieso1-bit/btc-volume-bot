@@ -184,6 +184,7 @@ def misma_zona(z1, z2):
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
+    """🚀 RADAR 0 – IMPULSO (con color según dirección)"""
     global last_impulse_time, last_event_time
     if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
         return
@@ -210,7 +211,7 @@ def radar_impulse(df_entry, precio_actual):
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
-    titulo = f"{emoji} IMPULSO {direccion} DETECTADO"
+    titulo = f"🚀 RADAR 0 – IMPULSO {direccion} {emoji}"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)}\n"
     msg += f"Volumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)\n"
@@ -220,6 +221,7 @@ def radar_impulse(df_entry, precio_actual):
     last_event_time = ahora
 
 def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
+    """🔄 RADAR 3 – SWEEP REVERSIÓN (con color)"""
     global sweep_pendiente, last_event_time
     if df_entry.empty or len(df_entry) < 2:
         return
@@ -236,7 +238,7 @@ def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             sweep_pendiente = None
             return
         ahora = datetime.now(UTC)
-        titulo = f"{emoji} RADAR 3 – SWEEP REVERSIÓN {direccion}"
+        titulo = f"🔄 RADAR 3 – SWEEP REVERSIÓN {direccion} {emoji}"
         msg = f"{titulo}\n\n"
         msg += f"Precio: {fmt(precio_actual)}\n"
         msg += f"Hora UTC: {ahora.strftime('%H:%M')}\n"
@@ -261,6 +263,7 @@ def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             sweep_pendiente = (mejor_abajo, "LOW")
 
 def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
+    """🌋 RADAR 4 – BREAKOUT (con color)"""
     global zona_consumida, last_event_time, alerted_liquidity
     if df_entry.empty:
         return
@@ -272,7 +275,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
         if key not in alerted_liquidity and close > mejor_arriba["max"] * 1.003:
             alerted_liquidity.add(key)
             zona_consumida = True
-            titulo = f"🟢 RADAR 4 – BREAKOUT ALCISTA"
+            titulo = f"🌋 RADAR 4 – BREAKOUT ALCISTA 🟢"
             msg = f"{titulo}\n\n"
             msg += f"Precio: {fmt(close)}\n"
             msg += f"Liquidez arriba consumida: {fmt(mejor_arriba['centro'])}\n"
@@ -287,7 +290,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
         if key not in alerted_liquidity and close < mejor_abajo["min"] * 0.997:
             alerted_liquidity.add(key)
             zona_consumida = True
-            titulo = f"🔴 RADAR 4 – BREAKOUT BAJISTA"
+            titulo = f"🌋 RADAR 4 – BREAKOUT BAJISTA 🔴"
             msg = f"{titulo}\n\n"
             msg += f"Precio: {fmt(close)}\n"
             msg += f"Liquidez abajo consumida: {fmt(mejor_abajo['centro'])}\n"
@@ -303,14 +306,14 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
 # =========================
 
 def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio):
-    """RADAR 1: solo la mejor zona, con título indicando HIGH/LOW"""
+    """📡 RADAR 1 – LIQUIDEZ DETECTADA (HIGH/LOW con color)"""
     if mejor_arriba:
-        titulo = f"🟢 RADAR 1 – LIQUIDEZ DETECTADA HIGH"
+        titulo = f"📡 RADAR 1 – LIQUIDEZ DETECTADA HIGH 🟢"
         nivel = formatear_liquidez_simple(mejor_arriba, precio)
         msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
         enviar(msg)
     if mejor_abajo:
-        titulo = f"🔴 RADAR 1 – LIQUIDEZ DETECTADA LOW"
+        titulo = f"📡 RADAR 1 – LIQUIDEZ DETECTADA LOW 🔴"
         nivel = formatear_liquidez_simple(mejor_abajo, precio)
         msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
         enviar(msg)
@@ -423,7 +426,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.8...")
+    print("🚀 Iniciando BOT V10.9...")
     precio_inicial = obtener_precio_actual()
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)
     if not df_temp.empty and precio_inicial:

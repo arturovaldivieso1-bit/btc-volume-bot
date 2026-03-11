@@ -21,7 +21,7 @@ LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
 PROXIMITY = 0.003          # 0.3% - umbral de proximidad
-ZONA_EQUIVALENTE = 0.003    # 0.3% - para unificar zonas cercanas
+ZONA_EQUIVALENTE = 0.005    # 0.5% - aumentado para unificar zonas cercanas
 
 IMPULSE_RANGE = 1.5
 IMPULSE_VOLUME = 1.3
@@ -37,10 +37,10 @@ last_impulse_time = None
 last_heartbeat_time = None
 last_event_time = None
 last_mapa_time = None
-zona_actual = None           # Tupla (centro_arriba, centro_abajo)
+zona_actual = None           # Tupla (centro_arriba_redondeado, centro_abajo_redondeado)
 zona_consumida = False
 alerted_liquidity = set()    # Para breakouts y sweeps
-alerted_proximidad = set()   # Para controlar alertas de proximidad por zona
+alerted_proximidad = set()   # Para controlar alertas de proximidad por zona (valores redondeados)
 sweep_pendiente = None
 
 # =========================
@@ -126,6 +126,10 @@ def detectar_zonas(df):
     zonas_low.sort(key=lambda x: x["toques"], reverse=True)
     return zonas_high, zonas_low
 
+def redondear_centro(centro):
+    """Redondea a la decena más cercana para estabilizar las claves"""
+    return round(centro / 10) * 10
+
 def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
     arriba = [z for z in zonas_high if z["centro"] > precio] + [z for z in zonas_low if z["centro"] > precio]
     abajo = [z for z in zonas_low if z["centro"] < precio] + [z for z in zonas_high if z["centro"] < precio]
@@ -133,9 +137,11 @@ def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
     for z in arriba:
         z["distancia"] = z["centro"] - precio
         z["score"] = z["toques"] * 1000 - z["distancia"]
+        z["centro_rd"] = redondear_centro(z["centro"])
     for z in abajo:
         z["distancia"] = precio - z["centro"]
         z["score"] = z["toques"] * 1000 - z["distancia"]
+        z["centro_rd"] = redondear_centro(z["centro"])
 
     arriba.sort(key=lambda x: x["score"], reverse=True)
     abajo.sort(key=lambda x: x["score"], reverse=True)
@@ -151,21 +157,16 @@ def formatear_nivel_simple(zona, precio):
     dist = abs(zona["centro"] - precio) / precio * 100
     return f"{fmt(zona['centro'])} ({dist:.1f}%)"
 
-def formatear_nivel_sin_distancia(zona):
-    """Solo nivel y toques: 70,884 | 11 toques 🔥"""
-    if zona is None:
-        return ""
-    return f"{fmt(zona['centro'])} | {zona['toques']} toques{' 🔥' if zona['toques'] >= 5 else ''}"
-
 def misma_zona(z1, z2):
     if z1 is None or z2 is None:
         return False
+    # z1 y z2 son tuplas de centros redondeados (arriba, abajo)
     c1_arriba, c1_abajo = z1
     c2_arriba, c2_abajo = z2
     if c1_arriba is None or c2_arriba is None or c1_abajo is None or c2_abajo is None:
         return False
-    diff_arriba = abs(c1_arriba - c2_arriba) / c1_arriba
-    diff_abajo = abs(c1_abajo - c2_abajo) / c1_abajo
+    diff_arriba = abs(c1_arriba - c2_arriba) / c1_arriba if c1_arriba != 0 else 0
+    diff_abajo = abs(c1_abajo - c2_abajo) / c1_abajo if c1_abajo != 0 else 0
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
 # =========================
@@ -255,7 +256,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
     close = vela["close"]
     ahora = datetime.now(UTC)
     if mejor_arriba:
-        key = ("break", round(mejor_arriba["centro"]))
+        key = ("break", mejor_arriba["centro_rd"])
         if key not in alerted_liquidity and close > mejor_arriba["max"] * 1.003:
             alerted_liquidity.add(key)
             zona_consumida = True
@@ -266,7 +267,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             last_event_time = ahora
             return
     if mejor_abajo:
-        key = ("break", round(mejor_abajo["centro"]))
+        key = ("break", mejor_abajo["centro_rd"])
         if key not in alerted_liquidity and close < mejor_abajo["min"] * 0.997:
             alerted_liquidity.add(key)
             zona_consumida = True
@@ -282,17 +283,17 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
 # =========================
 
 def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
-    """📦 Radar 1 – LIQUIDEZ [HIGH/LOW] [color] [nivel] (distancia%)"""
+    """💰 Radar 1 – LIQUIDEZ [HIGH/LOW] [color] [nivel] (distancia%)"""
     if mejor_arriba:
         nivel_str = formatear_nivel_simple(mejor_arriba, precio)
-        titulo = f"📦 Radar 1 – LIQUIDEZ HIGH 🟢 {nivel_str}"
+        titulo = f"💰 Radar 1 – LIQUIDEZ HIGH 🟢 {nivel_str}"
         msg = f"{titulo}\n\n"
         msg += f"Precio actual: {fmt(precio)} | Hora: {hora}\n"
         msg += f"{mejor_arriba['toques']} toques{' 🔥' if mejor_arriba['toques'] >= 5 else ''}"
         enviar(msg)
     if mejor_abajo:
         nivel_str = formatear_nivel_simple(mejor_abajo, precio)
-        titulo = f"📦 Radar 1 – LIQUIDEZ LOW 🔴 {nivel_str}"
+        titulo = f"💰 Radar 1 – LIQUIDEZ LOW 🔴 {nivel_str}"
         msg = f"{titulo}\n\n"
         msg += f"Precio actual: {fmt(precio)} | Hora: {hora}\n"
         msg += f"{mejor_abajo['toques']} toques{' 🔥' if mejor_abajo['toques'] >= 5 else ''}"
@@ -300,28 +301,34 @@ def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
 
 def radar_proximidad(mejor_arriba, mejor_abajo, precio, hora):
     """🔍 Radar 2 – CERCA [nivel] (distancia%) [color]"""
-    if mejor_arriba and (round(mejor_arriba["centro"]) not in alerted_proximidad):
+    # Verificar arriba
+    if mejor_arriba:
         dist = abs(precio - mejor_arriba["centro"]) / precio
         if dist < PROXIMITY:
-            alerted_proximidad.add(round(mejor_arriba["centro"]))
-            nivel_str = formatear_nivel_simple(mejor_arriba, precio)
-            titulo = f"🔍 Radar 2 – CERCA {nivel_str} 🟢"
-            msg = f"{titulo}\n\n"
-            msg += f"Precio: {fmt(precio)} | Hora: {hora}"
-            enviar(msg)
-            last_event_time = datetime.now(UTC)
-            return True
-    if mejor_abajo and (round(mejor_abajo["centro"]) not in alerted_proximidad):
+            key = mejor_arriba["centro_rd"]
+            if key not in alerted_proximidad:
+                alerted_proximidad.add(key)
+                nivel_str = formatear_nivel_simple(mejor_arriba, precio)
+                titulo = f"🔍 Radar 2 – CERCA {nivel_str} 🟢"
+                msg = f"{titulo}\n\n"
+                msg += f"Precio: {fmt(precio)} | Hora: {hora}"
+                enviar(msg)
+                last_event_time = datetime.now(UTC)
+                return True
+    # Verificar abajo
+    if mejor_abajo:
         dist = abs(precio - mejor_abajo["centro"]) / precio
         if dist < PROXIMITY:
-            alerted_proximidad.add(round(mejor_abajo["centro"]))
-            nivel_str = formatear_nivel_simple(mejor_abajo, precio)
-            titulo = f"🔍 Radar 2 – CERCA {nivel_str} 🔴"
-            msg = f"{titulo}\n\n"
-            msg += f"Precio: {fmt(precio)} | Hora: {hora}"
-            enviar(msg)
-            last_event_time = datetime.now(UTC)
-            return True
+            key = mejor_abajo["centro_rd"]
+            if key not in alerted_proximidad:
+                alerted_proximidad.add(key)
+                nivel_str = formatear_nivel_simple(mejor_abajo, precio)
+                titulo = f"🔍 Radar 2 – CERCA {nivel_str} 🔴"
+                msg = f"{titulo}\n\n"
+                msg += f"Precio: {fmt(precio)} | Hora: {hora}"
+                enviar(msg)
+                last_event_time = datetime.now(UTC)
+                return True
     return False
 
 def heartbeat():
@@ -367,9 +374,10 @@ def evaluar():
     zonas_high, zonas_low = detectar_zonas(df_macro)
     mejor_arriba, mejor_abajo = seleccionar_mejores_zonas(zonas_high, zonas_low, precio)
 
-    centro_arriba = mejor_arriba["centro"] if mejor_arriba else None
-    centro_abajo = mejor_abajo["centro"] if mejor_abajo else None
-    nueva_zona = (centro_arriba, centro_abajo)
+    # Obtener centros redondeados
+    centro_arriba_rd = mejor_arriba["centro_rd"] if mejor_arriba else None
+    centro_abajo_rd = mejor_abajo["centro_rd"] if mejor_abajo else None
+    nueva_zona = (centro_arriba_rd, centro_abajo_rd)
 
     # Si la zona cambió significativamente, actualizar y enviar RADAR 1 (con cooldown)
     if not misma_zona(zona_actual, nueva_zona):
@@ -383,18 +391,20 @@ def evaluar():
         last_event_time = ahora
 
     # Limpiar alertas de proximidad para zonas que ya no están cerca
+    # (los centros redondeados que ya no están en las mejores o cuya distancia supera el umbral)
     zonas_a_remover = []
     for key in alerted_proximidad:
-        zona_encontrada = None
-        if mejor_arriba and round(mejor_arriba["centro"]) == key:
-            zona_encontrada = mejor_arriba
-        elif mejor_abajo and round(mejor_abajo["centro"]) == key:
-            zona_encontrada = mejor_abajo
-        if zona_encontrada:
-            dist = abs(precio - zona_encontrada["centro"]) / precio
-            if dist >= PROXIMITY:
-                zonas_a_remover.append(key)
-        else:
+        # Verificar si alguna de las mejores zonas coincide con esta key
+        coincide = False
+        if mejor_arriba and mejor_arriba["centro_rd"] == key:
+            dist = abs(precio - mejor_arriba["centro"]) / precio
+            if dist < PROXIMITY:
+                coincide = True
+        if not coincide and mejor_abajo and mejor_abajo["centro_rd"] == key:
+            dist = abs(precio - mejor_abajo["centro"]) / precio
+            if dist < PROXIMITY:
+                coincide = True
+        if not coincide:
             zonas_a_remover.append(key)
     for key in zonas_a_remover:
         alerted_proximidad.discard(key)
@@ -420,7 +430,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.12...")
+    print("🚀 Iniciando BOT V10.13...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)

@@ -10,8 +10,6 @@ from datetime import datetime, timedelta
 # CONFIG
 # ================================
 
-print("BOT_DE_ARTURO V12 corriendo 🚀")
-
 SYMBOL = "BTC/USDT"
 TF_EVENT = "5m"
 TF_STRUCTURE = "1h"
@@ -22,8 +20,6 @@ LIQ_TOLERANCE = 0.002
 IMPULSE_MULT = 1.6
 VOL_MULT = 1.3
 
-# CONFIG (variables de entorno)
-# =========================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -31,11 +27,11 @@ HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 
 # ================================
-# FORMATO NUMEROS ALERTAS
+# FORMAT ALERTS
 # ================================
 
-def fmt(x):
-    return f"{int(round(x)):,}"
+def fmt(price):
+    return f"{int(price):,}"
 
 # ================================
 # TELEGRAM
@@ -67,12 +63,14 @@ def get_ohlc(tf, limit=200):
 # ================================
 
 def cluster_levels(levels, tolerance):
+
     clusters = []
 
     for price in levels:
         placed = False
 
         for cluster in clusters:
+
             if abs(price - cluster["price"]) / cluster["price"] < tolerance:
                 cluster["touches"] += 1
                 cluster["price"] = (cluster["price"] + price) / 2
@@ -134,12 +132,14 @@ def detect_sweep(df, liq_above, liq_below):
     confirm = df.iloc[-1]
 
     for lvl in liq_above:
+
         if last["high"] > lvl["price"] and last["close"] < lvl["price"]:
 
             if confirm["close"] < last["close"]:
                 return "sweep_high"
 
     for lvl in liq_below:
+
         if last["low"] < lvl["price"] and last["close"] > lvl["price"]:
 
             if confirm["close"] > last["close"]:
@@ -156,10 +156,12 @@ def detect_breakout(df, liq_above, liq_below):
     last = df.iloc[-1]
 
     for lvl in liq_above:
+
         if last["close"] > lvl["price"] * 1.003:
             return "breakout_up"
 
     for lvl in liq_below:
+
         if last["close"] < lvl["price"] * 0.997:
             return "breakout_down"
 

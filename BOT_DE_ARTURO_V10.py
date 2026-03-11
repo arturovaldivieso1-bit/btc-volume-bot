@@ -20,8 +20,8 @@ INTERVAL_ENTRY = "5m"
 LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
-PROXIMITY = 0.003
-ZONA_EQUIVALENTE = 0.002
+PROXIMITY = 0.003          # 0.3% - lo dejamos igual, pero podemos ajustar
+ZONA_EQUIVALENTE = 0.003    # 0.3% - aumentado para unificar zonas cercanas
 
 IMPULSE_RANGE = 1.5
 IMPULSE_VOLUME = 1.3
@@ -30,17 +30,17 @@ IMPULSE_COOLDOWN = 300
 
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
-MAPA_COOLDOWN_MINUTOS = 30
+MAPA_COOLDOWN_MINUTOS = 60  # Aumentado a 60 minutos
 
 # Variables de estado
 last_impulse_time = None
 last_heartbeat_time = None
 last_event_time = None
 last_mapa_time = None
-zona_actual = None
-zona_alertada_proximidad = False
+zona_actual = None           # Tupla (centro_arriba, centro_abajo)
 zona_consumida = False
-alerted_liquidity = set()
+alerted_liquidity = set()    # Para breakouts y sweeps
+alerted_proximidad = set()   # Para controlar alertas de proximidad por zona
 sweep_pendiente = None
 
 # =========================
@@ -305,17 +305,17 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
 # ALERTAS DE SISTEMA
 # =========================
 
-def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio):
+def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
     """📡 RADAR 1 – LIQUIDEZ DETECTADA (HIGH/LOW con color)"""
     if mejor_arriba:
         titulo = f"📡 RADAR 1 – LIQUIDEZ DETECTADA HIGH 🟢"
         nivel = formatear_liquidez_simple(mejor_arriba, precio)
-        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
+        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\nHora UTC: {hora}\n\nNivel: {nivel}"
         enviar(msg)
     if mejor_abajo:
         titulo = f"📡 RADAR 1 – LIQUIDEZ DETECTADA LOW 🔴"
         nivel = formatear_liquidez_simple(mejor_abajo, precio)
-        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\n\nNivel: {nivel}"
+        msg = f"{titulo}\n\nPrecio actual: {fmt(precio)}\nHora UTC: {hora}\n\nNivel: {nivel}"
         enviar(msg)
 
 def heartbeat():
@@ -338,7 +338,7 @@ def sin_eventos():
         return
     if (ahora - last_event_time) > timedelta(hours=NO_EVENT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"⚠️ MERCADO SIN EVENTOS RELEVANTES\nTiempo sin señales: {NO_EVENT_HOURS}h\nPrecio actual: {fmt(precio)}\nEstado: lateral / baja volatilidad"
+        msg = f"⚠️ MERCADO SIN EVENTOS RELEVANTES\nTiempo sin señales: {NO_EVENT_HOURS}h\nPrecio actual: {fmt(precio)}\nHora UTC: {ahora.strftime('%H:%M')}\nEstado: lateral / baja volatilidad"
         enviar(msg)
         last_event_time = ahora
 
@@ -347,9 +347,10 @@ def sin_eventos():
 # =========================
 
 def evaluar():
-    global zona_actual, zona_alertada_proximidad, zona_consumida, alerted_liquidity, last_event_time, last_mapa_time
+    global zona_actual, zona_consumida, alerted_liquidity, alerted_proximidad, last_event_time, last_mapa_time
 
     ahora = datetime.now(UTC)
+    hora_str = ahora.strftime('%H:%M')
 
     df_macro = obtener_candles(INTERVAL_MACRO)
     df_entry = obtener_candles(INTERVAL_ENTRY)
@@ -364,60 +365,79 @@ def evaluar():
     centro_abajo = mejor_abajo["centro"] if mejor_abajo else None
     nueva_zona = (centro_arriba, centro_abajo)
 
+    # Si la zona cambió significativamente, actualizar y enviar RADAR 1 (con cooldown)
     if not misma_zona(zona_actual, nueva_zona):
         zona_actual = nueva_zona
-        zona_alertada_proximidad = False
         zona_consumida = False
         alerted_liquidity.clear()
+        alerted_proximidad.clear()  # Reiniciar alertas de proximidad al cambiar la zona
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
-            if mejor_arriba:
-                enviar_liquidez_detectada(mejor_arriba, None, precio)
-            if mejor_abajo:
-                enviar_liquidez_detectada(None, mejor_abajo, precio)
+            enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora_str)
             last_mapa_time = ahora
         last_event_time = ahora
 
-    cerca_arriba = mejor_arriba and abs(precio - mejor_arriba["centro"]) / precio < PROXIMITY
-    cerca_abajo = mejor_abajo and abs(precio - mejor_abajo["centro"]) / precio < PROXIMITY
-    if not (cerca_arriba or cerca_abajo):
-        zona_alertada_proximidad = False
+    # Limpiar alertas de proximidad para zonas que ya no están cerca
+    zonas_a_remover = []
+    for key in alerted_proximidad:
+        # key es el centro de la zona (redondeado)
+        # Verificar si esa zona sigue siendo la mejor o al menos existe
+        # Simplificamos: si la distancia actual es > PROXIMITY, la removemos
+        zona_encontrada = None
+        if mejor_arriba and round(mejor_arriba["centro"]) == key:
+            zona_encontrada = mejor_arriba
+        elif mejor_abajo and round(mejor_abajo["centro"]) == key:
+            zona_encontrada = mejor_abajo
+        if zona_encontrada:
+            dist = abs(precio - zona_encontrada["centro"]) / precio
+            if dist >= PROXIMITY:
+                zonas_a_remover.append(key)
+        else:
+            # Si la zona ya no está en las mejores, también la removemos
+            zonas_a_remover.append(key)
+    for key in zonas_a_remover:
+        alerted_proximidad.discard(key)
 
-    if not zona_alertada_proximidad:
-        if cerca_arriba:
-            key = ("prox", round(mejor_arriba["centro"]))
-            if key not in alerted_liquidity:
-                alerted_liquidity.add(key)
-                dist = abs(precio - mejor_arriba["centro"]) / precio * 100
-                msg = f"🔍 RADAR 2 – PROXIMIDAD\n\n"
-                msg += f"Precio: {fmt(precio)}\n"
-                msg += f"Nivel: {fmt(mejor_arriba['centro'])} ({dist:.2f}%) | {mejor_arriba['toques']} toques"
-                if mejor_arriba["toques"] >= 5:
-                    msg += " 🔥"
-                if mejor_abajo:
-                    msg += f"\n\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, precio, es_arriba=False, mostrar_distancia=False)}"
-                enviar(msg)
-                last_event_time = ahora
-                zona_alertada_proximidad = True
-        elif cerca_abajo:
-            key = ("prox", round(mejor_abajo["centro"]))
-            if key not in alerted_liquidity:
-                alerted_liquidity.add(key)
-                dist = abs(precio - mejor_abajo["centro"]) / precio * 100
-                msg = f"🔍 RADAR 2 – PROXIMIDAD\n\n"
-                msg += f"Precio: {fmt(precio)}\n"
-                msg += f"Nivel: {fmt(mejor_abajo['centro'])} ({dist:.2f}%) | {mejor_abajo['toques']} toques"
-                if mejor_abajo["toques"] >= 5:
-                    msg += " 🔥"
-                if mejor_arriba:
-                    msg += f"\n\n🔼 Liquidez arriba: {formatear_liquidez_radar2(mejor_arriba, precio, es_arriba=True, mostrar_distancia=False)}"
-                enviar(msg)
-                last_event_time = ahora
-                zona_alertada_proximidad = True
+    # RADAR 2 - Proximidad (solo para la mejor zona que esté cerca y no alertada)
+    if mejor_arriba and (round(mejor_arriba["centro"]) not in alerted_proximidad):
+        dist = abs(precio - mejor_arriba["centro"]) / precio
+        if dist < PROXIMITY:
+            alerted_proximidad.add(round(mejor_arriba["centro"]))
+            msg = f"🔍 RADAR 2 – PROXIMIDAD\n\n"
+            msg += f"Precio: {fmt(precio)}\n"
+            msg += f"Hora UTC: {hora_str}\n"
+            msg += f"Nivel: {fmt(mejor_arriba['centro'])} ({dist*100:.2f}%) | {mejor_arriba['toques']} toques"
+            if mejor_arriba["toques"] >= 5:
+                msg += " 🔥"
+            if mejor_abajo:
+                msg += f"\n\n🔻 Liquidez abajo: {formatear_liquidez_radar2(mejor_abajo, precio, es_arriba=False, mostrar_distancia=False)}"
+            enviar(msg)
+            last_event_time = ahora
 
+    if mejor_abajo and (round(mejor_abajo["centro"]) not in alerted_proximidad):
+        dist = abs(precio - mejor_abajo["centro"]) / precio
+        if dist < PROXIMITY:
+            alerted_proximidad.add(round(mejor_abajo["centro"]))
+            msg = f"🔍 RADAR 2 – PROXIMIDAD\n\n"
+            msg += f"Precio: {fmt(precio)}\n"
+            msg += f"Hora UTC: {hora_str}\n"
+            msg += f"Nivel: {fmt(mejor_abajo['centro'])} ({dist*100:.2f}%) | {mejor_abajo['toques']} toques"
+            if mejor_abajo["toques"] >= 5:
+                msg += " 🔥"
+            if mejor_arriba:
+                msg += f"\n\n🔼 Liquidez arriba: {formatear_liquidez_radar2(mejor_arriba, precio, es_arriba=True, mostrar_distancia=False)}"
+            enviar(msg)
+            last_event_time = ahora
+
+    # RADAR 0
     radar_impulse(df_entry, precio)
+
+    # RADAR 3
     radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio)
+
+    # RADAR 4
     radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio)
 
+    # Alertas de sistema
     heartbeat()
     sin_eventos()
 
@@ -426,14 +446,15 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.9...")
+    print("🚀 Iniciando BOT V10.10...")
     precio_inicial = obtener_precio_actual()
+    hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)
     if not df_temp.empty and precio_inicial:
         zh, zl = detectar_zonas(df_temp)
         ma, mb = seleccionar_mejores_zonas(zh, zl, precio_inicial)
         msg = f"🤖 BOT DE ARTURO FUNCIONANDO\n"
-        msg += f"Hora UTC: {datetime.now(UTC).strftime('%H:%M')}\n"
+        msg += f"Hora UTC: {hora_actual}\n"
         msg += f"Precio: {fmt(precio_inicial)}\n"
         if ma:
             msg += f"\n🔼 Liquidez arriba: {formatear_liquidez_radar2(ma, precio_inicial, es_arriba=True)}"

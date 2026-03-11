@@ -25,7 +25,7 @@ last_impulse = None
 last_sweep = None
 last_breakout = None
 
-last_event_time = datetime.now(datetime.UTC)
+last_event_time = datetime.now(UTC)          # <-- CORREGIDO: antes era datetime.now(datetime.UTC)
 last_heartbeat = datetime.now(UTC)
 
 alerted_liquidity = set()

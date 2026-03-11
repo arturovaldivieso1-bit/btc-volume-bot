@@ -1,333 +1,321 @@
-import ccxt
+import requests
 import pandas as pd
 import numpy as np
 import time
-import requests
 import os
 from datetime import datetime, timedelta
-
-# ================================
-# CONFIG
-# ================================
-
-SYMBOL = "BTC/USDT"
-TF_EVENT = "5m"
-TF_STRUCTURE = "1h"
-
-LOOKBACK_LIQ = 168
-LIQ_TOLERANCE = 0.002
-
-IMPULSE_MULT = 1.6
-VOL_MULT = 1.3
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+SYMBOL = "BTCUSDT"
+INTERVAL = "5m"
+
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 
-# ================================
-# FORMAT ALERTS
-# ================================
+IMPULSE_RANGE = 1.3
+IMPULSE_VOLUME = 1.1
 
-def fmt(price):
-    return f"{int(price):,}"
+APPROACH_DISTANCE = 0.004
+CRITICAL_DISTANCE = 0.0015
+SWEEP_MIN = 0.001
 
-# ================================
-# TELEGRAM
-# ================================
+last_impulse = None
+last_sweep = None
+last_breakout = None
+
+last_event_time = datetime.utcnow()
+last_heartbeat = datetime.utcnow()
+
+alerted_liquidity = set()
+
 
 def send(msg):
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
-    except:
-        print("Error enviando mensaje")
 
-# ================================
-# BINANCE
-# ================================
+def fmt(n):
+    return f"{int(n):,}"
 
-exchange = ccxt.binance({
-    "enableRateLimit": True
-})
 
-# ================================
-# DATA
-# ================================
+def get_price():
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL}"
+    r = requests.get(url).json()
+    return float(r["price"])
 
-def get_ohlc(tf, limit=200):
 
-    ohlc = exchange.fetch_ohlcv(SYMBOL, timeframe=tf, limit=limit)
+def get_klines(limit=200):
+    url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit={limit}"
+    data = requests.get(url).json()
 
-    df = pd.DataFrame(
-        ohlc,
-        columns=["time","open","high","low","close","volume"]
-    )
+    df = pd.DataFrame(data, columns=[
+        "time","open","high","low","close","volume",
+        "ct","q","n","tbb","tbq","ignore"
+    ])
+
+    df["open"]=df["open"].astype(float)
+    df["high"]=df["high"].astype(float)
+    df["low"]=df["low"].astype(float)
+    df["close"]=df["close"].astype(float)
+    df["volume"]=df["volume"].astype(float)
 
     return df
 
-# ================================
-# LIQUIDITY DETECTION
-# ================================
 
-def cluster_levels(levels, tolerance):
+def find_liquidity(df):
 
-    clusters = []
+    highs=[]
+    lows=[]
 
-    for price in levels:
+    for i in range(3,len(df)-3):
 
-        placed = False
+        h=df["high"][i]
 
-        for cluster in clusters:
+        if h>df["high"][i-1] and h>df["high"][i-2] and h>df["high"][i+1] and h>df["high"][i+2]:
 
-            if abs(price - cluster["price"]) / cluster["price"] < tolerance:
+            touches=sum(abs(df["high"]-h)/h<0.0008)
 
-                cluster["touches"] += 1
-                cluster["price"] = (cluster["price"] + price) / 2
-
-                placed = True
-                break
-
-        if not placed:
-
-            clusters.append({
-                "price": price,
-                "touches": 1
+            highs.append({
+                "price":h,
+                "touches":touches
             })
 
-    return clusters
+        l=df["low"][i]
+
+        if l<df["low"][i-1] and l<df["low"][i-2] and l<df["low"][i+1] and l<df["low"][i+2]:
+
+            touches=sum(abs(df["low"]-l)/l<0.0008)
+
+            lows.append({
+                "price":l,
+                "touches":touches
+            })
+
+    highs=sorted(highs,key=lambda x:-x["touches"])
+    lows=sorted(lows,key=lambda x:-x["touches"])
+
+    return highs[:5],lows[:5]
 
 
-def get_liquidity(df, current_price):
+def radar_impulse(df):
 
-    highs = cluster_levels(df["high"], LIQ_TOLERANCE)
-    lows = cluster_levels(df["low"], LIQ_TOLERANCE)
+    global last_impulse,last_event_time
 
-    highs = sorted(highs, key=lambda x: x["price"])
-    lows = sorted(lows, key=lambda x: x["price"])
+    r=df.iloc[-1]
 
-    above = [h for h in highs if h["price"] > current_price][:2]
-    below = [l for l in reversed(lows) if l["price"] < current_price][:2]
+    range_val=(r["high"]-r["low"])/r["close"]
 
-    return above, below
+    vol=r["volume"]/df["volume"].rolling(20).mean().iloc[-1]
 
-# ================================
-# IMPULSE DETECTION
-# ================================
+    if range_val>IMPULSE_RANGE/100 and vol>IMPULSE_VOLUME:
 
-def detect_impulse(df):
+        if last_impulse is None or (datetime.utcnow()-last_impulse).seconds>900:
 
-    last = df.iloc[-1]
+            price=get_price()
 
-    avg_range = (df["high"] - df["low"]).mean()
-    avg_vol = df["volume"].mean()
+            send(
+f"""⚡ RADAR 0 — IMPULSO
 
-    range_now = last["high"] - last["low"]
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
 
-    if range_now > avg_range * IMPULSE_MULT and last["volume"] > avg_vol * VOL_MULT:
+Precio: {fmt(price)}
 
-        prev_high = df["high"].iloc[-12:-1].max()
-        prev_low = df["low"].iloc[-12:-1].min()
+Movimiento anómalo detectado"""
+            )
 
-        if last["close"] > prev_high:
-            return "bullish"
+            last_impulse=datetime.utcnow()
+            last_event_time=datetime.utcnow()
 
-        if last["close"] < prev_low:
-            return "bearish"
 
-    return None
+def radar_approach(price,levels):
 
-# ================================
-# SWEEP DETECTION
-# ================================
+    global last_event_time
 
-def detect_sweep(df, liq_above, liq_below):
+    for lvl in levels:
 
-    last = df.iloc[-2]
-    confirm = df.iloc[-1]
+        dist=abs(price-lvl["price"])/lvl["price"]
 
-    for lvl in liq_above:
+        if dist<APPROACH_DISTANCE:
 
-        if last["high"] > lvl["price"] and last["close"] < lvl["price"]:
+            key=("approach",round(lvl["price"]))
 
-            if confirm["close"] < last["close"]:
-                return "sweep_high", lvl["price"]
+            if key not in alerted_liquidity:
 
-    for lvl in liq_below:
+                send(
+f"""📡 RADAR 1 — APROXIMACIÓN
 
-        if last["low"] < lvl["price"] and last["close"] > lvl["price"]:
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
 
-            if confirm["close"] > last["close"]:
-                return "sweep_low", lvl["price"]
+Precio: {fmt(price)}
+Liquidez: {fmt(lvl["price"])}
 
-    return None, None
+Distancia: {fmt(abs(price-lvl["price"]))}"""
+                )
 
-# ================================
-# BREAKOUT DETECTION
-# ================================
+                alerted_liquidity.add(key)
+                last_event_time=datetime.utcnow()
 
-def detect_breakout(df, liq_above, liq_below):
 
-    last = df.iloc[-1]
+def radar_critical(price,levels):
 
-    for lvl in liq_above:
+    global last_event_time
 
-        if last["close"] > lvl["price"] * 1.003:
-            return "breakout_up"
+    for lvl in levels:
 
-    for lvl in liq_below:
+        dist=abs(price-lvl["price"])/lvl["price"]
 
-        if last["close"] < lvl["price"] * 0.997:
-            return "breakout_down"
+        if dist<CRITICAL_DISTANCE:
 
-    return None
+            key=("critical",round(lvl["price"]))
 
-# ================================
-# STARTUP
-# ================================
+            if key not in alerted_liquidity:
 
-def startup():
+                send(
+f"""⚠️ RADAR 2 — ZONA CRÍTICA
 
-    df = get_ohlc(TF_STRUCTURE, 200)
-    price = df["close"].iloc[-1]
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
 
-    above, below = get_liquidity(df, price)
+Precio: {fmt(price)}
+Liquidez: {fmt(lvl["price"])}
 
-    up = fmt(above[0]["price"]) if above else "N/A"
-    down = fmt(below[0]["price"]) if below else "N/A"
+Barrido probable"""
+                )
 
-    msg = f"""
-🟢 BOT STOP HUNT ENGINE ONLINE
+                alerted_liquidity.add(key)
+                last_event_time=datetime.utcnow()
 
-Activo: BTCUSDT
-TF estructura: 1H
-TF eventos: 5m
 
-Precio actual: {fmt(price)}
+def radar_sweep(df,levels):
 
-🟢 Liquidez arriba: {up}
-🔴 Liquidez abajo: {down}
-"""
+    global last_sweep,last_event_time
 
-    send(msg)
+    candle=df.iloc[-1]
 
-# ================================
-# VARIABLES DE CONTROL
-# ================================
+    for lvl in levels:
 
-last_heartbeat = datetime.now()
-last_event = datetime.now()
+        if candle["high"]>lvl["price"]*(1+SWEEP_MIN) and candle["close"]<lvl["price"]:
 
-last_candle_time = None
-last_sweep_level = None
+            key=("sweep",round(lvl["price"]))
 
-# ================================
-# START
-# ================================
+            if key not in alerted_liquidity:
 
-startup()
+                send(
+f"""🚨 RADAR 3 — SWEEP
+
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+
+Nivel barrido: {fmt(lvl["price"])}
+High sweep: {fmt(candle["high"])}
+
+Precio actual: {fmt(candle["close"])}
+
+Dirección probable: 🔻"""
+                )
+
+                alerted_liquidity.add(key)
+                last_event_time=datetime.utcnow()
+
+
+def radar_breakout(df,levels):
+
+    global last_breakout,last_event_time
+
+    candle=df.iloc[-1]
+
+    for lvl in levels:
+
+        if candle["close"]>lvl["price"]*(1+SWEEP_MIN):
+
+            key=("break",round(lvl["price"]))
+
+            if key not in alerted_liquidity:
+
+                send(
+f"""📡 RADAR 4 — BREAKOUT
+
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+
+Nivel roto: {fmt(lvl["price"])}
+
+Precio actual: {fmt(candle["close"])}
+
+Continuación probable: 🔺"""
+                )
+
+                alerted_liquidity.add(key)
+                last_event_time=datetime.utcnow()
+
+
+def heartbeat():
+
+    global last_heartbeat
+
+    if (datetime.utcnow()-last_heartbeat)>timedelta(hours=HEARTBEAT_HOURS):
+
+        price=get_price()
+
+        send(
+f"""💓 BOT ACTIVO
+
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+
+Precio BTC: {fmt(price)}"""
+        )
+
+        last_heartbeat=datetime.utcnow()
+
+
+def no_events():
+
+    global last_event_time
+
+    if (datetime.utcnow()-last_event_time)>timedelta(hours=NO_EVENT_HOURS):
+
+        price=get_price()
+
+        send(
+f"""🟡 SIN EVENTOS
+
+Hora UTC: {datetime.utcnow().strftime("%H:%M")}
+
+Precio BTC: {fmt(price)}"""
+        )
+
+        last_event_time=datetime.utcnow()
+
+
+send("🤖 BOT BTC INICIADO")
 
 while True:
 
     try:
 
-        df5 = get_ohlc(TF_EVENT, 200)
+        df=get_klines()
 
-        current_candle = df5["time"].iloc[-1]
+        price=get_price()
 
-        if current_candle == last_candle_time:
-            time.sleep(20)
-            continue
+        highs,lows=find_liquidity(df)
 
-        last_candle_time = current_candle
+        radar_impulse(df)
 
-        df1 = get_ohlc(TF_STRUCTURE, 200)
+        radar_approach(price,highs+lows)
 
-        price = df5["close"].iloc[-1]
+        radar_critical(price,highs+lows)
 
-        liq_above, liq_below = get_liquidity(df1, price)
+        radar_sweep(df,highs)
 
-        impulse = detect_impulse(df5)
-        sweep, sweep_level = detect_sweep(df5, liq_above, liq_below)
-        breakout = detect_breakout(df5, liq_above, liq_below)
+        radar_breakout(df,highs)
 
-        # =====================
-        # IMPULSE
-        # =====================
+        heartbeat()
 
-        if impulse == "bullish":
+        no_events()
 
-            msg = f"""
-⚡ IMPULSO ALCISTA DETECTADO
-
-Precio: {fmt(price)}
-"""
-
-            send(msg)
-            last_event = datetime.now()
-
-        # =====================
-        # SWEEP
-        # =====================
-
-        if sweep == "sweep_high":
-
-            if sweep_level != last_sweep_level:
-
-                msg = f"""
-🚨 SWEEP DE LIQUIDEZ ARRIBA DETECTADO
-
-Precio: {fmt(price)}
-
-Dirección probable: 🔻 bajista
-"""
-
-                send(msg)
-
-                last_sweep_level = sweep_level
-                last_event = datetime.now()
-
-        # =====================
-        # BREAKOUT
-        # =====================
-
-        if breakout == "breakout_up":
-
-            msg = f"""
-📡 BREAKOUT ALCISTA CONFIRMADO
-
-Precio: {fmt(price)}
-"""
-
-            send(msg)
-            last_event = datetime.now()
-
-        # =====================
-        # HEARTBEAT
-        # =====================
-
-        if datetime.now() - last_heartbeat > timedelta(hours=HEARTBEAT_HOURS):
-
-            send(f"💓 BOT ACTIVO\nPrecio BTC: {fmt(price)}")
-
-            last_heartbeat = datetime.now()
-
-        # =====================
-        # NO EVENTS
-        # =====================
-
-        if datetime.now() - last_event > timedelta(hours=NO_EVENT_HOURS):
-
-            send("⚠️ MERCADO SIN EVENTOS RELEVANTES (6H)")
-
-            last_event = datetime.now()
-
-        time.sleep(30)
+        time.sleep(60)
 
     except Exception as e:
 
-        send(f"⚠️ ERROR BOT: {str(e)}")
-        time.sleep(60)
+        send(f"⚠️ ERROR BOT\n{str(e)}")
+
+        time.sleep(120)

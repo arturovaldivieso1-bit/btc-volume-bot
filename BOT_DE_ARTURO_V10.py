@@ -20,7 +20,7 @@ INTERVAL_ENTRY = "5m"
 LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
-PROXIMITY = 0.003          # 0.3% - umbral de proximidad (lo dejamos)
+PROXIMITY = 0.003          # 0.3% - umbral de proximidad
 ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas en Radar 2
 
 IMPULSE_RANGE = 1.5
@@ -31,7 +31,7 @@ IMPULSE_COOLDOWN = 300
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 MAPA_COOLDOWN_MINUTOS = 60
-RADAR2_COOLDOWN_MINUTOS = 30  # Cooldown para repetir alerta de la misma zona redondeada
+RADAR2_COOLDOWN_MINUTOS = 60  # Aumentado a 60 minutos
 
 # Variables de estado
 last_impulse_time = None
@@ -41,7 +41,7 @@ last_mapa_time = None
 zona_actual = None
 zona_consumida = False
 alerted_liquidity = set()        # Para breakouts y sweeps
-alerted_proximidad = {}           # Diccionario {zona_redondeada: timestamp}
+alerted_proximidad = {}           # Diccionario {(centro_rd, tipo): timestamp}
 sweep_pendiente = None
 
 # =========================
@@ -127,8 +127,8 @@ def detectar_zonas(df):
     zonas_low.sort(key=lambda x: x["toques"], reverse=True)
     return zonas_high, zonas_low
 
-def redondear_centro(centro, base=50):
-    """Redondea a múltiplos de 'base' (ej. 50) para estabilizar claves"""
+def redondear_centro(centro, base=100):
+    """Redondea a múltiplos de 'base' (ahora 100) para estabilizar claves"""
     return round(centro / base) * base
 
 def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
@@ -301,11 +301,11 @@ def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
         enviar(msg)
 
 def radar_proximidad(mejor_arriba, mejor_abajo, precio, hora):
-    """🔍 Radar 2 – CERCA [nivel] (distancia%) [color] con cooldown de 30 min por zona redondeada"""
+    """🔍 Radar 2 – CERCA [nivel] (distancia%) [color] con cooldown de 60 min por zona redondeada y tipo"""
     ahora = datetime.now(UTC)
     
     def check_and_send(zona, color_emoji):
-        key = zona["centro_rd"]
+        key = (zona["centro_rd"], zona["tipo"])  # Clave compuesta: (centro_redondeado, HIGH/LOW)
         dist = abs(precio - zona["centro"]) / precio
         if dist < PROXIMITY:
             ultimo = alerted_proximidad.get(key)
@@ -378,19 +378,16 @@ def evaluar():
         zona_actual = nueva_zona
         zona_consumida = False
         alerted_liquidity.clear()
-        # No limpiar alerted_proximidad para mantener cooldown, pero sí eliminar zonas que ya no existen
-        # (se hará más abajo con la limpieza)
+        # No limpiar alerted_proximidad al cambiar de zona, solo limpieza periódica más abajo
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
             enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora_str)
             last_mapa_time = ahora
         last_event_time = ahora
 
-    # Limpiar del diccionario de proximidad las zonas que ya no están presentes
+    # Limpieza periódica de timestamps muy antiguos en alerted_proximidad (más de 2 horas)
     keys_a_remover = []
-    for key in alerted_proximidad:
-        # Verificar si alguna de las mejores zonas tiene este centro redondeado
-        presente = (mejor_arriba and mejor_arriba["centro_rd"] == key) or (mejor_abajo and mejor_abajo["centro_rd"] == key)
-        if not presente:
+    for key, ts in alerted_proximidad.items():
+        if (ahora - ts) > timedelta(hours=2):
             keys_a_remover.append(key)
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
@@ -416,7 +413,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.15...")
+    print("🚀 Iniciando BOT V10.16...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)

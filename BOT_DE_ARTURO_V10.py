@@ -20,8 +20,8 @@ INTERVAL_ENTRY = "5m"
 LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
-PROXIMITY = 0.003          # 0.3% - umbral de proximidad
-ZONA_EQUIVALENTE = 0.01     # 1% - aumentado para unificar zonas cercanas
+PROXIMITY = 0.003          # 0.3% - umbral de proximidad (lo dejamos)
+ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas en Radar 2
 
 IMPULSE_RANGE = 1.5
 IMPULSE_VOLUME = 1.3
@@ -31,7 +31,7 @@ IMPULSE_COOLDOWN = 300
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 MAPA_COOLDOWN_MINUTOS = 60
-RADAR2_COOLDOWN_MINUTOS = 30  # Cooldown para repetir alerta de la misma zona
+RADAR2_COOLDOWN_MINUTOS = 30  # Cooldown para repetir alerta de la misma zona redondeada
 
 # Variables de estado
 last_impulse_time = None
@@ -159,9 +159,9 @@ def formatear_nivel_simple(zona, precio):
     return f"{fmt(zona['centro'])} ({dist:.1f}%)"
 
 def misma_zona(z1, z2):
+    """Compara dos tuplas (centro_arriba_rd, centro_abajo_rd) con tolerancia ZONA_EQUIVALENTE"""
     if z1 is None or z2 is None:
         return False
-    # z1 y z2 son tuplas de centros redondeados (arriba, abajo)
     c1_arriba, c1_abajo = z1
     c2_arriba, c2_abajo = z2
     if c1_arriba is None or c2_arriba is None or c1_abajo is None or c2_abajo is None:
@@ -304,12 +304,10 @@ def radar_proximidad(mejor_arriba, mejor_abajo, precio, hora):
     """🔍 Radar 2 – CERCA [nivel] (distancia%) [color] con cooldown de 30 min por zona redondeada"""
     ahora = datetime.now(UTC)
     
-    # Función auxiliar para verificar y enviar
     def check_and_send(zona, color_emoji):
         key = zona["centro_rd"]
         dist = abs(precio - zona["centro"]) / precio
         if dist < PROXIMITY:
-            # Verificar cooldown
             ultimo = alerted_proximidad.get(key)
             if ultimo is None or (ahora - ultimo) > timedelta(minutes=RADAR2_COOLDOWN_MINUTOS):
                 alerted_proximidad[key] = ahora
@@ -418,7 +416,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.14...")
+    print("🚀 Iniciando BOT V10.15...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)

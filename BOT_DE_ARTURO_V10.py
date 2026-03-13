@@ -23,12 +23,26 @@ CLUSTER_RANGE = 0.0025
 PROXIMITY = 0.003          # 0.3% - umbral de proximidad
 ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas
 
-# Radar 0 - Impulso
-IMPULSE_RANGE = 1.5
-IMPULSE_VOLUME = 1.3
-IMPULSE_PRICE_CHANGE = 0.7   # Nueva condición: variación mínima del precio en %
-IMPULSE_LOOKBACK = 12
-IMPULSE_COOLDOWN = 300
+# Radar 0 - Impulso (ahora basado en variación de precio)
+IMPULSE_PRICE_CHANGE = 0.65   # Variación mínima en % (condición principal)
+IMPULSE_LOOKBACK = 12          # Velas para ruptura de microestructura
+IMPULSE_COOLDOWN = 300         # 5 minutos entre alertas
+
+# Umbrales de volumen para probabilidades (en BTC) - ajustados según tu análisis
+VOL1_MED = 400
+VOL1_P75 = 692
+VOL1_P90 = 1134
+PROB1 = [68, 82, 87]      # probabilidades para >med, >p75, >p90 (1 vela)
+
+VOL2_MED = 712
+VOL2_P75 = 1189
+VOL2_P90 = 1876
+PROB2 = [72, 84, 88]      # para 2 velas
+
+VOL3_MED = 1023
+VOL3_P75 = 1645
+VOL3_P90 = 2534
+PROB3 = [75, 86, 90]      # para 3 velas
 
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
@@ -169,29 +183,36 @@ def misma_zona(z1, z2):
     diff_abajo = abs(c1_abajo - c2_abajo) / c1_abajo if c1_abajo != 0 else 0
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
+def calcular_probabilidad(volumen, umbrales, probabilidades):
+    """Devuelve la probabilidad según el volumen y los umbrales dados."""
+    if volumen > umbrales[2]:  # > p90
+        return probabilidades[2]
+    elif volumen > umbrales[1]:  # > p75
+        return probabilidades[1]
+    elif volumen > umbrales[0]:  # > mediana
+        return probabilidades[0]
+    else:
+        return None  # No alcanza el mínimo
+
 # =========================
 # RADARES
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
-    """🚀 Radar 0 - Impulso [dirección] [color] (ahora con opción de variación de precio)"""
+    """🚀 Radar 0 - Impulso basado en variación de precio >= 0.65% y ruptura de microestructura.
+       Muestra volúmenes acumulados y probabilidades de retroceso."""
     global last_impulse_time, last_event_time
     if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
         return
     vela = df_entry.iloc[-1]
-    rango = (vela["high"] - vela["low"]) / vela["close"] * 100
-    rango_medio = ((df_entry["high"] - df_entry["low"]) / df_entry["close"]).rolling(20).mean().iloc[-1] * 100
-    vol_actual = vela["volume"]
-    vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-    # Calcular variación de precio (absoluta)
+    # Calcular variación de precio
     price_change = abs(vela["close"] - vela["open"]) / vela["open"] * 100
 
-    # Condición combinada: (rango y volumen) O (variación significativa)
-    condicion_principal = (rango >= IMPULSE_RANGE * rango_medio and vol_actual >= IMPULSE_VOLUME * vol_medio) or (price_change >= IMPULSE_PRICE_CHANGE)
-    if not condicion_principal:
+    # Condición principal: variación >= umbral
+    if price_change < IMPULSE_PRICE_CHANGE:
         return
 
-    # Verificar ruptura de microestructura
+    # Verificar ruptura de microestructura (rompe máximos/mínimos de últimas IMPULSE_LOOKBACK velas)
     ventana = df_entry.iloc[-IMPULSE_LOOKBACK-1:-1]
     max_anterior = ventana["high"].max()
     min_anterior = ventana["low"].min()
@@ -210,11 +231,33 @@ def radar_impulse(df_entry, precio_actual):
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
 
+    # Calcular volúmenes acumulados
+    vol1 = vela["volume"]
+    vol2 = vol1 + (df_entry.iloc[-2]["volume"] if len(df_entry) >= 2 else 0)
+    vol3 = vol2 + (df_entry.iloc[-3]["volume"] if len(df_entry) >= 3 else 0)
+
+    # Calcular probabilidades
+    prob1 = calcular_probabilidad(vol1, (VOL1_MED, VOL1_P75, VOL1_P90), PROB1)
+    prob2 = calcular_probabilidad(vol2, (VOL2_MED, VOL2_P75, VOL2_P90), PROB2)
+    prob3 = calcular_probabilidad(vol3, (VOL3_MED, VOL3_P75, VOL3_P90), PROB3)
+
+    # Construir mensaje
     titulo = f"🚀 Radar 0 - Impulso {direccion} {emoji}"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
-    msg += f"Volumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)\n"
-    msg += f"Variación: {price_change:.2f}%"
+    msg += f"Variación: {price_change:.2f}%\n"
+    msg += f"Volumen 1v: {vol1:.2f} BTC"
+    if prob1:
+        msg += f" (prob retroceso {prob1}%)"
+    msg += "\n"
+    msg += f"Volumen 2v: {vol2:.2f} BTC"
+    if prob2:
+        msg += f" (prob retroceso {prob2}%)"
+    msg += "\n"
+    msg += f"Volumen 3v: {vol3:.2f} BTC"
+    if prob3:
+        msg += f" (prob retroceso {prob3}%)"
+
     enviar(msg)
     last_impulse_time = ahora
     last_event_time = ahora
@@ -410,7 +453,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.17...")
+    print("🚀 Iniciando BOT V10.19...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)

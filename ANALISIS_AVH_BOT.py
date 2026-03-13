@@ -23,7 +23,7 @@ if not TOKEN or not CHAT_ID:
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
 LIMIT = 1000  # Máximo por request de Binance
-TOTAL_VELAS = 10000  # Número de velas a analizar (aprox 34 días de datos 5m)
+TOTAL_VELAS = 1000  # REDUCIDO TEMPORALMENTE para prueba rápida (aprox 3.5 días de datos 5m)
 MOVIMIENTO_MIN = 0.7  # % mínimo de movimiento neto
 RELACION_CUERPO_MIN = 0.7  # Relación mínima cuerpo/rango
 
@@ -43,9 +43,13 @@ def obtener_velas(symbol, interval, limit=1000, end_time=None):
         params["endTime"] = end_time
     
     try:
-        response = requests.get(base_url, params=params, timeout=10)
+        logger.info(f"Solicitando velas con end_time={end_time}")
+        response = requests.get(base_url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
+        if not data:
+            logger.warning("Respuesta vacía de Binance")
+            return None
         # Convertir a DataFrame
         df = pd.DataFrame(data, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -60,7 +64,11 @@ def obtener_velas(symbol, interval, limit=1000, end_time=None):
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        logger.info(f"Obtenidas {len(df)} velas")
         return df
+    except requests.exceptions.Timeout:
+        logger.error("Timeout en la solicitud a Binance")
+        return None
     except Exception as e:
         logger.error(f"Error al obtener velas: {e}")
         return None
@@ -72,28 +80,39 @@ def recolectar_velas(symbol, interval, total_velas, limit=1000):
     """
     all_velas = []
     end_time = None  # empezamos desde ahora (sin end_time)
+    intentos_fallidos = 0
     
     while len(all_velas) < total_velas:
+        logger.info(f"Progreso: {len(all_velas)} velas obtenidas de {total_velas}")
         df = obtener_velas(symbol, interval, limit, end_time)
         if df is None or df.empty:
-            break
+            intentos_fallidos += 1
+            if intentos_fallidos >= 3:
+                logger.error("Demasiados intentos fallidos, abortando recolección")
+                break
+            logger.warning(f"Intento fallido {intentos_fallidos}/3, esperando 2 segundos...")
+            time.sleep(2)
+            continue
+        intentos_fallidos = 0
         all_velas.append(df)
         # Actualizar end_time al open_time de la primera vela (la más antigua de este lote)
         # Necesitamos el timestamp en ms de la primera vela - 1ms para evitar duplicados
         primer_open = df.iloc[0]['open_time']
         end_time = int(primer_open.timestamp() * 1000) - 1
         # Pequeña pausa para no saturar la API
-        time.sleep(0.1)
+        time.sleep(0.2)
     
     if not all_velas:
         return None
     
     # Combinar todos los DataFrames y eliminar duplicados
+    logger.info("Combinando todos los lotes...")
     df_total = pd.concat(all_velas, ignore_index=True)
     df_total.drop_duplicates(subset=['open_time'], keep='first', inplace=True)
     df_total.sort_values('open_time', ascending=True, inplace=True)
     # Tomar las últimas 'total_velas'
     df_total = df_total.tail(total_velas)
+    logger.info(f"Total final de velas: {len(df_total)}")
     return df_total
 
 # Función para calcular métricas y filtrar velas
@@ -136,7 +155,6 @@ def analizar_velas(df):
         'min_vol': velas_filtradas['volume'].min(),
     }
     
-    # También podemos añadir un pequeño dataframe de ejemplo (opcional)
     return velas_filtradas, stats
 
 # Función para enviar mensaje por Telegram
@@ -150,22 +168,25 @@ def enviar_telegram(mensaje):
     try:
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
-        logger.info("Mensaje enviado correctamente")
+        logger.info("Mensaje enviado correctamente por Telegram")
     except Exception as e:
-        logger.error(f"Error al enviar mensaje: {e}")
+        logger.error(f"Error al enviar mensaje por Telegram: {e}")
 
 # Función principal
 def main():
-    logger.info("Iniciando análisis de volumen")
+    logger.info("=== INICIANDO ANÁLISIS DE VOLUMEN ===")
+    logger.info(f"Configuración: {SYMBOL} {INTERVAL}, velas a obtener: {TOTAL_VELAS}")
     
     # Recolectar datos
+    logger.info("Iniciando descarga de velas desde Binance...")
     df_velas = recolectar_velas(SYMBOL, INTERVAL, TOTAL_VELAS, LIMIT)
     if df_velas is None:
         logger.error("No se pudieron obtener datos")
         enviar_telegram("❌ Error: No se pudieron obtener datos de Binance")
         return
     
-    logger.info(f"Velas obtenidas: {len(df_velas)}")
+    logger.info(f"Velas obtenidas correctamente: {len(df_velas)}")
+    logger.info("Procesando datos y calculando estadísticas...")
     
     # Analizar
     velas_filtradas, stats = analizar_velas(df_velas)
@@ -176,6 +197,7 @@ def main():
         msg += f"Total velas: {len(df_velas)}\n"
         msg += "No se encontraron velas que cumplan las condiciones de movimiento decidido."
         enviar_telegram(msg)
+        logger.info("No se encontraron velas que cumplan condiciones")
         return
     
     # Construir mensaje
@@ -206,7 +228,7 @@ def main():
         msg += "Podrías reducir el umbral para capturar más operaciones."
     
     enviar_telegram(msg)
-    logger.info("Análisis completado")
+    logger.info("=== ANÁLISIS COMPLETADO ===")
 
 if __name__ == "__main__":
     main()

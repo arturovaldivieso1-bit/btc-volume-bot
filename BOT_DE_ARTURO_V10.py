@@ -21,17 +21,19 @@ LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
 PROXIMITY = 0.003          # 0.3% - umbral de proximidad
-ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas en Radar 2
+ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas
 
+# Radar 0 - Impulso
 IMPULSE_RANGE = 1.5
 IMPULSE_VOLUME = 1.3
+IMPULSE_PRICE_CHANGE = 0.7   # Nueva condición: variación mínima del precio en %
 IMPULSE_LOOKBACK = 12
 IMPULSE_COOLDOWN = 300
 
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 MAPA_COOLDOWN_MINUTOS = 60
-RADAR2_COOLDOWN_MINUTOS = 60  # Aumentado a 60 minutos
+RADAR2_COOLDOWN_MINUTOS = 60
 
 # Variables de estado
 last_impulse_time = None
@@ -40,8 +42,8 @@ last_event_time = None
 last_mapa_time = None
 zona_actual = None
 zona_consumida = False
-alerted_liquidity = set()        # Para breakouts y sweeps
-alerted_proximidad = {}           # Diccionario {(centro_rd, tipo): timestamp}
+alerted_liquidity = set()
+alerted_proximidad = {}
 sweep_pendiente = None
 
 # =========================
@@ -128,7 +130,6 @@ def detectar_zonas(df):
     return zonas_high, zonas_low
 
 def redondear_centro(centro, base=100):
-    """Redondea a múltiplos de 'base' (ahora 100) para estabilizar claves"""
     return round(centro / base) * base
 
 def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
@@ -152,14 +153,12 @@ def seleccionar_mejores_zonas(zonas_high, zonas_low, precio):
     return mejor_arriba, mejor_abajo
 
 def formatear_nivel_simple(zona, precio):
-    """Formato para mostrar nivel con distancia: 70,884 (0.1%)"""
     if zona is None:
         return ""
     dist = abs(zona["centro"] - precio) / precio * 100
     return f"{fmt(zona['centro'])} ({dist:.1f}%)"
 
 def misma_zona(z1, z2):
-    """Compara dos tuplas (centro_arriba_rd, centro_abajo_rd) con tolerancia ZONA_EQUIVALENTE"""
     if z1 is None or z2 is None:
         return False
     c1_arriba, c1_abajo = z1
@@ -175,7 +174,7 @@ def misma_zona(z1, z2):
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
-    """🚀 Radar 0 - Impulso [dirección] [color]"""
+    """🚀 Radar 0 - Impulso [dirección] [color] (ahora con opción de variación de precio)"""
     global last_impulse_time, last_event_time
     if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
         return
@@ -184,28 +183,38 @@ def radar_impulse(df_entry, precio_actual):
     rango_medio = ((df_entry["high"] - df_entry["low"]) / df_entry["close"]).rolling(20).mean().iloc[-1] * 100
     vol_actual = vela["volume"]
     vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-    if rango < IMPULSE_RANGE * rango_medio or vol_actual < IMPULSE_VOLUME * vol_medio:
+    # Calcular variación de precio (absoluta)
+    price_change = abs(vela["close"] - vela["open"]) / vela["open"] * 100
+
+    # Condición combinada: (rango y volumen) O (variación significativa)
+    condicion_principal = (rango >= IMPULSE_RANGE * rango_medio and vol_actual >= IMPULSE_VOLUME * vol_medio) or (price_change >= IMPULSE_PRICE_CHANGE)
+    if not condicion_principal:
         return
+
+    # Verificar ruptura de microestructura
     ventana = df_entry.iloc[-IMPULSE_LOOKBACK-1:-1]
     max_anterior = ventana["high"].max()
     min_anterior = ventana["low"].min()
-    if vela["close"] > vela["open"]:
+    if vela["close"] > vela["open"]:  # vela alcista
         if vela["high"] <= max_anterior:
             return
         direccion = "alcista"
         emoji = "🟢"
-    else:
+    else:  # vela bajista
         if vela["low"] >= min_anterior:
             return
         direccion = "bajista"
         emoji = "🔴"
+
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
+
     titulo = f"🚀 Radar 0 - Impulso {direccion} {emoji}"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
-    msg += f"Volumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)"
+    msg += f"Volumen: {vol_actual:.2f} BTC ({(vol_actual/vol_medio):.1f}x media)\n"
+    msg += f"Variación: {price_change:.2f}%"
     enviar(msg)
     last_impulse_time = ahora
     last_event_time = ahora
@@ -305,7 +314,7 @@ def radar_proximidad(mejor_arriba, mejor_abajo, precio, hora):
     ahora = datetime.now(UTC)
     
     def check_and_send(zona, color_emoji):
-        key = (zona["centro_rd"], zona["tipo"])  # Clave compuesta: (centro_redondeado, HIGH/LOW)
+        key = (zona["centro_rd"], zona["tipo"])
         dist = abs(precio - zona["centro"]) / precio
         if dist < PROXIMITY:
             ultimo = alerted_proximidad.get(key)
@@ -368,23 +377,20 @@ def evaluar():
     zonas_high, zonas_low = detectar_zonas(df_macro)
     mejor_arriba, mejor_abajo = seleccionar_mejores_zonas(zonas_high, zonas_low, precio)
 
-    # Obtener centros redondeados para la zona actual
     centro_arriba_rd = mejor_arriba["centro_rd"] if mejor_arriba else None
     centro_abajo_rd = mejor_abajo["centro_rd"] if mejor_abajo else None
     nueva_zona = (centro_arriba_rd, centro_abajo_rd)
 
-    # Si la zona cambió significativamente, actualizar y enviar RADAR 1 (con cooldown)
     if not misma_zona(zona_actual, nueva_zona):
         zona_actual = nueva_zona
         zona_consumida = False
         alerted_liquidity.clear()
-        # No limpiar alerted_proximidad al cambiar de zona, solo limpieza periódica más abajo
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
             enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora_str)
             last_mapa_time = ahora
         last_event_time = ahora
 
-    # Limpieza periódica de timestamps muy antiguos en alerted_proximidad (más de 2 horas)
+    # Limpieza de timestamps antiguos en proximidad
     keys_a_remover = []
     for key, ts in alerted_proximidad.items():
         if (ahora - ts) > timedelta(hours=2):
@@ -392,19 +398,10 @@ def evaluar():
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
 
-    # RADAR 2 - Proximidad (con cooldown)
     radar_proximidad(mejor_arriba, mejor_abajo, precio, hora_str)
-
-    # RADAR 0
     radar_impulse(df_entry, precio)
-
-    # RADAR 3
     radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio)
-
-    # RADAR 4
     radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio)
-
-    # Alertas de sistema
     heartbeat()
     sin_eventos()
 
@@ -413,7 +410,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V10.16...")
+    print("🚀 Iniciando BOT V10.17...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     df_temp = obtener_candles(INTERVAL_MACRO, limit=LOOKBACK)

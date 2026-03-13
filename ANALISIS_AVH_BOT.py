@@ -6,33 +6,29 @@ from datetime import datetime
 import time
 import logging
 
-# ================= CONFIGURACIÓN INICIAL =================
+# ================= CONFIGURACIÓN =================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Variables de entorno (deben estar definidas en Railway)
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 if not TOKEN or not CHAT_ID:
-    raise ValueError("Faltan las variables de entorno TOKEN o CHAT_ID")
+    raise ValueError("Faltan TOKEN o CHAT_ID en variables de entorno")
 
-# Parámetros del análisis (puedes modificarlos)
+# Parámetros del análisis
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
-TOTAL_VELAS = 1000          # Número de velas a analizar (para prueba rápida, luego puedes subir a 10000)
-MOVIMIENTO_MIN = 0.7         # % mínimo de movimiento neto (cierre - apertura)
-RELACION_CUERPO_MIN = 0.7    # Relación mínima cuerpo / rango total
+TOTAL_VELAS = 10000          # Unos 35 días de datos (puedes subir a 20000)
+MOVIMIENTO_MIN = 0.7          # % mínimo de movimiento neto
+RELACION_CUERPO_MIN = 0.7     # Relación mínima cuerpo/rango
 
 # ================= FUNCIONES =================
 
 def obtener_velas(symbol, interval, limit=1000, end_time=None):
-    """
-    Obtiene un lote de velas desde Binance.
-    Si se proporciona end_time (timestamp en ms), obtiene velas hasta esa fecha.
-    """
+    """Obtiene un lote de velas de Binance"""
     base_url = "https://api.binance.com/api/v3/klines"
     params = {
         "symbol": symbol,
@@ -43,16 +39,12 @@ def obtener_velas(symbol, interval, limit=1000, end_time=None):
         params["endTime"] = end_time
 
     try:
-        logger.debug(f"Consultando Binance con end_time={end_time}")
         response = requests.get(base_url, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
-
         if not data:
-            logger.warning("Binance devolvió una lista vacía")
             return None
 
-        # Convertir a DataFrame
         df = pd.DataFrame(data, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -65,204 +57,211 @@ def obtener_velas(symbol, interval, limit=1000, end_time=None):
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-
         return df
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout al conectar con Binance")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error en la petición a Binance: {e}")
-        return None
     except Exception as e:
-        logger.error(f"Error inesperado al procesar velas: {e}")
+        logger.error(f"Error obteniendo velas: {e}")
         return None
 
 
 def recolectar_velas(symbol, interval, total_velas, limit=1000):
-    """
-    Recolecta exactamente 'total_velas' velas (o las máximas posibles)
-    navegando hacia atrás en el tiempo.
-    """
-    inicio_total = time.time()
+    """Recolecta exactamente total_velas velas hacia atrás"""
+    inicio = time.time()
     lotes = []
     end_time = None
     acumulado = 0
     intentos_fallidos = 0
-    max_intentos_fallidos = 3
+    max_intentos = 3
 
-    logger.info(f"Iniciando recolección de {total_velas} velas {interval} de {symbol}")
+    logger.info(f"Recolectando {total_velas} velas {interval} de {symbol}")
 
-    while acumulado < total_velas and intentos_fallidos < max_intentos_fallidos:
-        logger.info(f"Solicitando lote con end_time={end_time if end_time else 'ahora'}")
+    while acumulado < total_velas and intentos_fallidos < max_intentos:
+        logger.info(f"Solicitando lote con end_time={end_time}")
         df = obtener_velas(symbol, interval, limit, end_time)
 
         if df is None or df.empty:
             intentos_fallidos += 1
-            logger.warning(f"Intento fallido {intentos_fallidos}/{max_intentos_fallidos}")
+            logger.warning(f"Intento fallido {intentos_fallidos}/{max_intentos}")
             time.sleep(1)
             continue
 
-        # Si es el primer lote o hay continuidad, añadimos
         lotes.append(df)
         acumulado += len(df)
-        logger.info(f"Lote obtenido: {len(df)} velas. Acumulado: {acumulado}/{total_velas}")
+        logger.info(f"Lote: {len(df)} velas. Total: {acumulado}/{total_velas}")
 
-        # Preparamos el próximo end_time (anterior a la primera vela de este lote)
         primer_open = df.iloc[0]['open_time']
         end_time = int(primer_open.timestamp() * 1000) - 1
-        intentos_fallidos = 0  # Reiniciamos contador de fallos
+        intentos_fallidos = 0
 
-        # Si la API devolvió menos velas de las que pedimos (último lote histórico), salimos
         if len(df) < limit:
-            logger.info("Se alcanzó el final de los datos históricos disponibles.")
+            logger.info("Fin de datos históricos")
             break
 
-        time.sleep(0.1)  # Pequeña pausa para no saturar la API
+        time.sleep(0.1)
 
     if not lotes:
-        logger.error("No se pudo obtener ninguna vela")
         return None
 
-    # Combinar todos los lotes y limpiar duplicados
-    logger.info("Combinando lotes y eliminando duplicados...")
     df_total = pd.concat(lotes, ignore_index=True)
     df_total.drop_duplicates(subset=['open_time'], keep='first', inplace=True)
     df_total.sort_values('open_time', ascending=True, inplace=True)
 
-    # Ajustar al número exacto solicitado (tomar las más recientes)
     if len(df_total) > total_velas:
         df_total = df_total.tail(total_velas)
-        logger.info(f"Recortado a las últimas {total_velas} velas.")
-    else:
-        logger.info(f"Solo se pudieron obtener {len(df_total)} velas (menos de las solicitadas).")
 
-    fin_total = time.time()
-    logger.info(f"Recolección completada en {fin_total - inicio_total:.2f} segundos. Velas finales: {len(df_total)}")
+    logger.info(f"Recolección completada en {time.time()-inicio:.2f}s. Velas: {len(df_total)}")
     return df_total
 
 
-def analizar_velas(df):
-    """
-    Calcula el movimiento porcentual, la relación cuerpo/rango y filtra
-    las velas que cumplen las condiciones. Retorna estadísticas de volumen.
-    """
-    if df is None or df.empty:
-        return None, None
+def calcular_stats(df_filtrado, nombre_grupo="General"):
+    """Calcula estadísticas de volumen para un DataFrame filtrado"""
+    if df_filtrado is None or df_filtrado.empty:
+        logger.warning(f"No hay datos para {nombre_grupo}")
+        return None
 
-    # Evitar división por cero en open (muy raro pero por si acaso)
+    return {
+        'grupo': nombre_grupo,
+        'conteo': len(df_filtrado),
+        'media': df_filtrado['volume'].mean(),
+        'mediana': df_filtrado['volume'].median(),
+        'min': df_filtrado['volume'].min(),
+        'max': df_filtrado['volume'].max(),
+        'p25': df_filtrado['volume'].quantile(0.25),
+        'p50': df_filtrado['volume'].quantile(0.50),
+        'p70': df_filtrado['volume'].quantile(0.70),
+        'p75': df_filtrado['volume'].quantile(0.75),
+        'p80': df_filtrado['volume'].quantile(0.80),
+        'p85': df_filtrado['volume'].quantile(0.85),
+        'p90': df_filtrado['volume'].quantile(0.90),
+    }
+
+
+def analizar_velas(df):
+    """Filtra velas y calcula stats por dirección"""
+    if df is None or df.empty:
+        return None, None, None, None
+
     df = df[df['open'] != 0].copy()
 
-    # Movimiento neto en porcentaje
+    # Métricas
     df['mov_pct'] = (df['close'] - df['open']) / df['open'] * 100
-
-    # Rango total en porcentaje
     df['rango_pct'] = (df['high'] - df['low']) / df['open'] * 100
-
-    # Relación cuerpo / rango (evitar división por cero)
     df['rel_cuerpo'] = abs(df['close'] - df['open']) / (df['high'] - df['low'])
     df['rel_cuerpo'].replace([np.inf, -np.inf], 0, inplace=True)
     df['rel_cuerpo'].fillna(0, inplace=True)
 
-    # Filtrar por condiciones
+    # Filtro principal
     condicion = (abs(df['mov_pct']) >= MOVIMIENTO_MIN) & (df['rel_cuerpo'] >= RELACION_CUERPO_MIN)
     velas_filtradas = df[condicion].copy()
 
     if velas_filtradas.empty:
-        logger.warning("No se encontraron velas que cumplan las condiciones.")
-        return velas_filtradas, None
+        logger.warning("No hay velas que cumplan condiciones")
+        return None, None, None, None
 
-    # Estadísticas de volumen
-    stats = {
-        'total_velas_analizadas': len(df),
-        'velas_que_cumplen': len(velas_filtradas),
-        'media_vol': velas_filtradas['volume'].mean(),
-        'mediana_vol': velas_filtradas['volume'].median(),
-        'percentil_25': velas_filtradas['volume'].quantile(0.25),
-        'percentil_75': velas_filtradas['volume'].quantile(0.75),
-        'percentil_90': velas_filtradas['volume'].quantile(0.90),
-        'max_vol': velas_filtradas['volume'].max(),
-        'min_vol': velas_filtradas['volume'].min(),
-    }
+    # Separar por dirección
+    alcistas = velas_filtradas[velas_filtradas['mov_pct'] > 0].copy()
+    bajistas = velas_filtradas[velas_filtradas['mov_pct'] < 0].copy()
 
-    logger.info(f"Análisis completado: {stats['velas_que_cumplen']} velas cumplen condiciones.")
-    return velas_filtradas, stats
+    # Calcular stats
+    stats_gral = calcular_stats(velas_filtradas, "Totales")
+    stats_alc = calcular_stats(alcistas, "Alcistas") if not alcistas.empty else None
+    stats_baj = calcular_stats(bajistas, "Bajistas") if not bajistas.empty else None
+
+    return stats_gral, stats_alc, stats_baj, velas_filtradas
+
+
+def formato_stats(stats):
+    """Convierte stats a string legible"""
+    if stats is None:
+        return "   (sin datos)\n"
+    return (f"   • Conteo: {stats['conteo']}\n"
+            f"   • Mediana: {stats['mediana']:.2f} BTC\n"
+            f"   • Media: {stats['media']:.2f} BTC\n"
+            f"   • Min: {stats['min']:.2f} | Max: {stats['max']:.2f}\n"
+            f"   • P25: {stats['p25']:.2f} | P75: {stats['p75']:.2f}\n"
+            f"   • P70: {stats['p70']:.2f} | P80: {stats['p80']:.2f} | P90: {stats['p90']:.2f}\n")
 
 
 def enviar_telegram(mensaje):
-    """Envía un mensaje a Telegram usando el bot configurado."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': mensaje,
-        'parse_mode': 'HTML'
-    }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.info("Mensaje de Telegram enviado correctamente.")
+        requests.post(url, json={'chat_id': CHAT_ID, 'text': mensaje, 'parse_mode': 'HTML'}, timeout=10)
+        logger.info("Mensaje enviado")
     except Exception as e:
-        logger.error(f"Error al enviar mensaje por Telegram: {e}")
+        logger.error(f"Error al enviar: {e}")
 
 
 def main():
-    logger.info("=== INICIANDO ANÁLISIS DE VOLUMEN ===")
-    logger.info(f"Configuración: {SYMBOL} {INTERVAL}, velas a obtener: {TOTAL_VELAS}")
+    logger.info("=== INICIO ANÁLISIS DE VOLUMEN ===")
+    logger.info(f"Buscando velas {SYMBOL} {INTERVAL} con mov >= {MOVIMIENTO_MIN}% y cuerpo/rango >= {RELACION_CUERPO_MIN}")
 
     # Recolectar datos
     df_velas = recolectar_velas(SYMBOL, INTERVAL, TOTAL_VELAS, limit=1000)
-    if df_velas is None or df_velas.empty:
-        logger.error("No se obtuvieron datos. Abortando.")
-        enviar_telegram("❌ Error: No se pudieron obtener datos de Binance.")
+    if df_velas is None:
+        enviar_telegram("❌ No se pudieron obtener datos de Binance.")
         return
 
     # Analizar
-    velas_filtradas, stats = analizar_velas(df_velas)
+    stats_gral, stats_alc, stats_baj, velas_filtradas = analizar_velas(df_velas)
 
-    # Construir mensaje para Telegram
-    fecha_inicio = df_velas['open_time'].min().strftime('%Y-%m-%d %H:%M')
+    # Construir mensaje
+    fecha_ini = df_velas['open_time'].min().strftime('%Y-%m-%d %H:%M')
     fecha_fin = df_velas['open_time'].max().strftime('%Y-%m-%d %H:%M')
 
-    if stats is None:
-        msg = f"📊 <b>Análisis de volumen para {SYMBOL} ({INTERVAL})</b>\n\n"
-        msg += f"Período analizado: {fecha_inicio} a {fecha_fin}\n"
-        msg += f"Total velas: {len(df_velas)}\n"
-        msg += "No se encontraron velas que cumplan las condiciones de movimiento decidido."
+    msg = f"📊 <b>Análisis de volumen para {SYMBOL} ({INTERVAL})</b>\n"
+    msg += f"Período: {fecha_ini} a {fecha_fin}\n"
+    msg += f"Velas totales analizadas: {len(df_velas)}\n\n"
+
+    if stats_gral is None:
+        msg += "❌ No se encontraron velas que cumplan las condiciones."
         enviar_telegram(msg)
         return
 
-    # Estadísticas disponibles
-    msg = f"📊 <b>Análisis de volumen para {SYMBOL} ({INTERVAL})</b>\n\n"
-    msg += f"Período: {fecha_inicio} a {fecha_fin}\n"
-    msg += f"Velas analizadas: {stats['total_velas_analizadas']}\n"
-    msg += f"Velas con movimiento ≥{MOVIMIENTO_MIN}% y cuerpo/rango ≥{RELACION_CUERPO_MIN}: {stats['velas_que_cumplen']}\n\n"
-    msg += "<b>Estadísticas de volumen (BTC) en esas velas:</b>\n"
-    msg += f"• Media: {stats['media_vol']:.2f}\n"
-    msg += f"• Mediana: {stats['mediana_vol']:.2f}\n"
-    msg += f"• Percentil 25: {stats['percentil_25']:.2f}\n"
-    msg += f"• Percentil 75: {stats['percentil_75']:.2f}\n"
-    msg += f"• Percentil 90: {stats['percentil_90']:.2f}\n"
-    msg += f"• Mínimo: {stats['min_vol']:.2f}\n"
-    msg += f"• Máximo: {stats['max_vol']:.2f}\n\n"
+    msg += f"✅ Velas que cumplen condición: {stats_gral['conteo']}\n\n"
 
-    # Interpretación con tu observación de 400 BTC
-    if stats['percentil_75'] >= 400:
-        msg += "🔍 <b>Observación:</b> El valor de 400 BTC se encuentra por debajo del percentil 75, "
-        msg += "lo que indica que aproximadamente el 75% de los movimientos decididos ocurren con volumen ≤ 400 BTC. "
-        msg += "Si buscas mayor probabilidad, considera usar el percentil 75 como umbral."
+    # Totales
+    msg += "<b>📈 Estadísticas generales (ambas direcciones):</b>\n"
+    msg += formato_stats(stats_gral)
+
+    # Alcistas
+    msg += "\n<b>🟢 Alcistas (mov > 0):</b>\n"
+    msg += formato_stats(stats_alc) if stats_alc else "   (no hay suficientes datos)\n"
+
+    # Bajistas
+    msg += "\n<b>🔴 Bajistas (mov < 0):</b>\n"
+    msg += formato_stats(stats_baj) if stats_baj else "   (no hay suficientes datos)\n"
+
+    # Interpretación y recomendación sobre 400 BTC
+    msg += "\n🔍 <b>Análisis de tu hipótesis (400 BTC):</b>\n"
+
+    # Usamos el percentil 75 general como referencia
+    p75 = stats_gral['p75']
+    if p75 >= 400:
+        msg += f"• El percentil 75 es {p75:.2f} BTC (≥400). Esto indica que el 75% de los movimientos ocurren con volumen ≤ {p75:.2f}.\n"
+        msg += f"• Tu umbral de 400 BTC está por DEBAJO del P75, por lo que capturarías aproximadamente el {stats_gral['p70']:.1f}% de los eventos (usando P70 como referencia).\n"
     else:
-        msg += "🔍 <b>Observación:</b> El valor de 400 BTC está por encima del percentil 75, "
-        msg += "lo que significa que más del 75% de los movimientos decididos requieren menos volumen. "
-        msg += "Podrías reducir el umbral para capturar más operaciones."
+        msg += f"• El percentil 75 es {p75:.2f} BTC (<400). Esto significa que más del 75% de los movimientos requieren MENOS de 400 BTC.\n"
+        msg += f"• Con 400 BTC solo capturarías los eventos más voluminosos (por encima del P{((stats_gral['p90']<400)*90 + (stats_gral['p80']<400)*80 + ... )} ).\n"
+
+    msg += "\n📌 <b>Recomendación de umbrales según tu objetivo:</b>\n"
+    msg += f"• Para alta probabilidad (P75): {stats_gral['p75']:.2f} BTC\n"
+    msg += f"• Para equilibrio (P50/mediana): {stats_gral['p50']:.2f} BTC\n"
+    msg += f"• Para máxima frecuencia (P25): {stats_gral['p25']:.2f} BTC\n"
+
+    if stats_alc and stats_baj:
+        msg += "\n📊 <b>Asimetría alcista/bajista:</b>\n"
+        dif = abs(stats_alc['p75'] - stats_baj['p75']) / max(stats_alc['p75'], stats_baj['p75']) * 100
+        if dif > 20:
+            msg += f"• Hay diferencia significativa: Alcistas P75={stats_alc['p75']:.2f}, Bajistas P75={stats_baj['p75']:.2f}. Considera umbrales separados.\n"
+        else:
+            msg += f"• Alcistas y bajistas tienen umbrales similares (diferencia <20%).\n"
 
     enviar_telegram(msg)
-    logger.info("=== ANÁLISIS FINALIZADO ===")
+    logger.info("=== ANÁLISIS COMPLETADO ===")
 
 
 if __name__ == "__main__":
-    # Ejecutar una vez (Railway lanzará el script y terminará)
-    # Si quieres que se ejecute cada cierto tiempo, puedes descomentar el bucle siguiente:
+    # Ejecutar una vez. Para ejecución periódica, descomentar el bucle.
     # while True:
-    #     main()
-    #     time.sleep(86400)  # 24 horas
     main()
+    # time.sleep(86400)  # 24 horas

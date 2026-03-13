@@ -20,29 +20,37 @@ INTERVAL_ENTRY = "5m"
 LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
-PROXIMITY = 0.003          # 0.3% - umbral de proximidad
-ZONA_EQUIVALENTE = 0.005    # 0.5% - para unificar zonas cercanas
+PROXIMITY = 0.003          # 0.3%
+ZONA_EQUIVALENTE = 0.005    # 0.5%
 
-# Radar 0 - Impulso (ahora basado en variación de precio)
-IMPULSE_PRICE_CHANGE = 0.65   # Variación mínima en % (condición principal)
-IMPULSE_LOOKBACK = 12          # Velas para ruptura de microestructura
-IMPULSE_COOLDOWN = 300         # 5 minutos entre alertas
+# Radar 0 - Impulso (basado en estudio)
+IMPULSE_PRICE_CHANGE = 0.65   # variación mínima en %
+IMPULSE_COOLDOWN = 300        # 5 minutos
 
-# Umbrales de volumen para probabilidades (en BTC) - ajustados según tu análisis
+# Umbrales de volumen (BTC) y probabilidades de continuación
+# 1 vela
 VOL1_MED = 400
 VOL1_P75 = 692
 VOL1_P90 = 1134
-PROB1 = [68, 82, 87]      # probabilidades para >med, >p75, >p90 (1 vela)
+PROB1_MED = 68
+PROB1_P75 = 82
+PROB1_P90 = 85
 
+# 2 velas (acumulado alerta + anterior, misma dirección)
 VOL2_MED = 712
 VOL2_P75 = 1189
 VOL2_P90 = 1876
-PROB2 = [72, 84, 88]      # para 2 velas
+PROB2_MED = 72
+PROB2_P75 = 84
+PROB2_P90 = 87
 
+# 3 velas (acumulado alerta + 2 anteriores, misma dirección)
 VOL3_MED = 1023
 VOL3_P75 = 1645
 VOL3_P90 = 2534
-PROB3 = [75, 86, 90]      # para 3 velas
+PROB3_MED = 75
+PROB3_P75 = 86
+PROB3_P90 = 89
 
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
@@ -183,8 +191,12 @@ def misma_zona(z1, z2):
     diff_abajo = abs(c1_abajo - c2_abajo) / c1_abajo if c1_abajo != 0 else 0
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
-def calcular_probabilidad(volumen, umbrales, probabilidades):
-    """Devuelve la probabilidad según el volumen y los umbrales dados."""
+def obtener_probabilidad(volumen, umbrales, probabilidades):
+    """
+    Dado un volumen y listas de umbrales y probabilidades, devuelve la probabilidad correspondiente.
+    umbrales: [med, p75, p90] en orden creciente
+    probabilidades: [prob_med, prob_p75, prob_p90]
+    """
     if volumen > umbrales[2]:  # > p90
         return probabilidades[2]
     elif volumen > umbrales[1]:  # > p75
@@ -192,78 +204,83 @@ def calcular_probabilidad(volumen, umbrales, probabilidades):
     elif volumen > umbrales[0]:  # > mediana
         return probabilidades[0]
     else:
-        return None  # No alcanza el mínimo
+        return None
 
 # =========================
 # RADARES
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
-    """🚀 Radar 0 - Impulso basado en variación de precio >= 0.65% y ruptura de microestructura.
-       Muestra volúmenes acumulados y probabilidades de retroceso."""
+    """🚀 Radar 0 - Impulso (solo por variación ≥ 0.65%) + estadísticas de volumen por tendencia"""
     global last_impulse_time, last_event_time
-    if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
+    if df_entry.empty or len(df_entry) < 3:
         return
+
     vela = df_entry.iloc[-1]
-    # Calcular variación de precio
     price_change = abs(vela["close"] - vela["open"]) / vela["open"] * 100
 
-    # Condición principal: variación >= umbral
     if price_change < IMPULSE_PRICE_CHANGE:
         return
-
-    # Verificar ruptura de microestructura (rompe máximos/mínimos de últimas IMPULSE_LOOKBACK velas)
-    ventana = df_entry.iloc[-IMPULSE_LOOKBACK-1:-1]
-    max_anterior = ventana["high"].max()
-    min_anterior = ventana["low"].min()
-    if vela["close"] > vela["open"]:  # vela alcista
-        if vela["high"] <= max_anterior:
-            return
-        direccion = "alcista"
-        emoji = "🟢"
-    else:  # vela bajista
-        if vela["low"] >= min_anterior:
-            return
-        direccion = "bajista"
-        emoji = "🔴"
 
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
 
-    # Calcular volúmenes acumulados
+    # Determinar dirección
+    alcista = vela["close"] > vela["open"]
+    direccion = "alcista" if alcista else "bajista"
+    emoji = "🟢" if alcista else "🔴"
+
+    # Volumen de la vela actual
     vol1 = vela["volume"]
-    vol2 = vol1 + (df_entry.iloc[-2]["volume"] if len(df_entry) >= 2 else 0)
-    vol3 = vol2 + (df_entry.iloc[-3]["volume"] if len(df_entry) >= 3 else 0)
+    vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
 
-    # Calcular probabilidades
-    prob1 = calcular_probabilidad(vol1, (VOL1_MED, VOL1_P75, VOL1_P90), PROB1)
-    prob2 = calcular_probabilidad(vol2, (VOL2_MED, VOL2_P75, VOL2_P90), PROB2)
-    prob3 = calcular_probabilidad(vol3, (VOL3_MED, VOL3_P75, VOL3_P90), PROB3)
+    # Preparar lista de probabilidades a mostrar
+    prob_lines = []
 
-    # Construir mensaje
+    # Probabilidad 1 vela (siempre se muestra si supera mediana, si no, se omite)
+    prob1 = obtener_probabilidad(vol1, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
+    if prob1:
+        prob_lines.append(f"  1 vela ({vol1:.0f} BTC): {prob1}%")
+
+    # Acumulado 2 velas (solo si la vela anterior tiene misma dirección)
+    if len(df_entry) >= 2:
+        vela_ant = df_entry.iloc[-2]
+        alcista_ant = vela_ant["close"] > vela_ant["open"]
+        if alcista == alcista_ant:
+            vol2 = vol1 + vela_ant["volume"]
+            prob2 = obtener_probabilidad(vol2, [VOL2_MED, VOL2_P75, VOL2_P90], [PROB2_MED, PROB2_P75, PROB2_P90])
+            if prob2:
+                prob_lines.append(f"  2 velas (misma dir, {vol2:.0f} BTC): {prob2}%")
+
+    # Acumulado 3 velas (solo si las dos anteriores tienen misma dirección)
+    if len(df_entry) >= 3:
+        vela_ant2 = df_entry.iloc[-3]
+        alcista_ant2 = vela_ant2["close"] > vela_ant2["open"]
+        if alcista == alcista_ant and alcista == alcista_ant2:
+            vol3 = vol1 + df_entry.iloc[-2]["volume"] + df_entry.iloc[-3]["volume"]
+            prob3 = obtener_probabilidad(vol3, [VOL3_MED, VOL3_P75, VOL3_P90], [PROB3_MED, PROB3_P75, PROB3_P90])
+            if prob3:
+                prob_lines.append(f"  3 velas (misma dir, {vol3:.0f} BTC): {prob3}%")
+
+    # Si no hay ninguna probabilidad (todas por debajo de mediana), mostramos solo la base 68%
+    if not prob_lines:
+        prob_lines.append(f"  Volumen insuficiente: probabilidad base 68%")
+
     titulo = f"🚀 Radar 0 - Impulso {direccion} {emoji}"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
     msg += f"Variación: {price_change:.2f}%\n"
-    msg += f"Volumen 1v: {vol1:.2f} BTC"
-    if prob1:
-        msg += f" (prob retroceso {prob1}%)"
-    msg += "\n"
-    msg += f"Volumen 2v: {vol2:.2f} BTC"
-    if prob2:
-        msg += f" (prob retroceso {prob2}%)"
-    msg += "\n"
-    msg += f"Volumen 3v: {vol3:.2f} BTC"
-    if prob3:
-        msg += f" (prob retroceso {prob3}%)"
+    msg += f"Volumen actual: {vol1:.2f} BTC ({(vol1/vol_medio):.1f}x media)\n\n"
+    msg += f"📊 Probabilidad de continuación (sin retroceso):\n"
+    msg += "\n".join(prob_lines)
 
     enviar(msg)
     last_impulse_time = ahora
     last_event_time = ahora
 
 def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
-    """🔄 Radar 3 – SWEEP [HIGH/LOW] [color] (nivel barrido)"""
+    """🔄 Radar 3 – SWEEP (sin cambios)"""
     global sweep_pendiente, last_event_time
     if df_entry.empty or len(df_entry) < 2:
         return
@@ -301,7 +318,7 @@ def radar_sweep(df_entry, mejor_arriba, mejor_abajo, precio_actual):
             sweep_pendiente = (mejor_abajo, "LOW")
 
 def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
-    """🌋 Radar 4 – BREAKOUT [dirección] [color] (nivel barrido)"""
+    """🌋 Radar 4 – BREAKOUT (sin cambios)"""
     global zona_consumida, last_event_time, alerted_liquidity
     if df_entry.empty:
         return
@@ -336,7 +353,7 @@ def radar_breakout(df_entry, mejor_arriba, mejor_abajo, precio_actual):
 # =========================
 
 def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
-    """💰 Radar 1 – LIQUIDEZ [HIGH/LOW] [color] [nivel] (distancia%)"""
+    """💰 Radar 1 – LIQUIDEZ [HIGH/LOW]"""
     if mejor_arriba:
         nivel_str = formatear_nivel_simple(mejor_arriba, precio)
         titulo = f"💰 Radar 1 – LIQUIDEZ HIGH 🟢 {nivel_str}"
@@ -353,7 +370,7 @@ def enviar_liquidez_detectada(mejor_arriba, mejor_abajo, precio, hora):
         enviar(msg)
 
 def radar_proximidad(mejor_arriba, mejor_abajo, precio, hora):
-    """🔍 Radar 2 – CERCA [nivel] (distancia%) [color] con cooldown de 60 min por zona redondeada y tipo"""
+    """🔍 Radar 2 – CERCA (con cooldown)"""
     ahora = datetime.now(UTC)
     
     def check_and_send(zona, color_emoji):

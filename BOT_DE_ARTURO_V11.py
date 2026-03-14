@@ -15,28 +15,26 @@ CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTCUSDT"
 
 # Timeframes
-INTERVAL_MACRO = "1h"      # Para estructura de liquidez (spot)
-INTERVAL_ENTRY = "5m"      # Para eventos
+INTERVAL_MACRO = "1h"
+INTERVAL_ENTRY = "5m"
 
-# Parámetros de liquidez spot (toques)
+# Parámetros de liquidez spot
 LOOKBACK = 168
 MIN_TOUCHES = 3
-CLUSTER_RANGE = 0.0025
-PROXIMITY = 0.003          # 0.3%
-ZONA_EQUIVALENTE = 0.005    # 0.5%
+CLUSTER_RANGE = 0.0025        # 0.25% para agrupar precios
+PROXIMITY = 0.003              # 0.3% umbral inferior para Radar 2
+RADAR1_MIN_DIST = 0.01         # 1% umbral mínimo para enviar Radar 1
+ZONA_EQUIVALENTE = 0.005       # 0.5% para considerar misma zona
 
-# Parámetros de Open Interest (futuros) - ajustados para más sensibilidad
-OI_SURGE_THRESHOLD = 20_000_000      # $20M mínimo para pico individual
-OI_ACCUMULATED_THRESHOLD = 40_000_000 # $40M acumulado en 3 velas
-OI_LOOKBACK = 3                       # ventana para acumulado
-OI_CLUSTER_RANGE = 0.002              # 0.2% para agrupar zonas de OI
-OI_CONFIANZA_ALTA = 200_000_000       # > $200M → confianza 🔥🔥🔥
-OI_CONFIANZA_MEDIA = 100_000_000      # > $100M → confianza 🔥🔥
+# Parámetros de Open Interest (futuros) - más sensibles
+OI_SURGE_THRESHOLD = 20_000_000        # $20M
+OI_ACCUMULATED_THRESHOLD = 40_000_000  # $40M acumulado en 3 velas
+OI_LOOKBACK = 3
+OI_CLUSTER_RANGE = 0.002               # 0.2% para agrupar zonas de OI
+OI_CONFIANZA_ALTA = 200_000_000
+OI_CONFIANZA_MEDIA = 100_000_000
 
-# Redondeo de centros (más amplio para estabilidad)
-REDONDEO_BASE = 200
-
-# Radar 0 - Impulso (basado en estudio)
+# Radar 0 - Impulso
 IMPULSE_PRICE_CHANGE = 0.65
 IMPULSE_COOLDOWN = 300
 
@@ -66,22 +64,21 @@ PROB3_P90 = 89
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
 MAPA_COOLDOWN_MINUTOS = 60
-RADAR2_COOLDOWN_MINUTOS = 120        # Aumentado a 2 horas
+RADAR2_COOLDOWN_MINUTOS = 120         # 2 horas para evitar spam
+REDONDEO_BASE = 200                    # Redondeo a 200 para estabilizar
 
 # Variables de estado
 last_impulse_time = None
 last_heartbeat_time = None
 last_event_time = None
 last_mapa_time = None
-zona_actual = None                    # Tupla (centro_oi_arriba, centro_oi_abajo) o (None,None)
+zona_actual = None                     # Tupla (centro_arriba, centro_abajo) priorizando OI
 zona_consumida = False
-alerted_liquidity = set()              # Para breakouts y sweeps
-alerted_proximidad = {}                 # {(centro_rd, tipo): timestamp}
+alerted_liquidity = set()               # Para breakouts y sweeps
+alerted_proximidad = {}                  # Diccionario {(centro_rd, tipo): timestamp}
 sweep_pendiente = None
-
-# Últimas zonas enviadas por Radar 1 (para coherencia con Radar 2)
-ultima_zona_arriba = None
-ultima_zona_abajo = None
+ultima_zona_arriba = None               # Centro de la última zona enviada por Radar 1 (arriba)
+ultima_zona_abajo = None                 # Centro de la última zona enviada por Radar 1 (abajo)
 
 # =========================
 # FUNCIONES AUXILIARES (SPOT)
@@ -166,6 +163,9 @@ def detectar_zonas_spot(df):
     zonas_low.sort(key=lambda x: x["toques"], reverse=True)
     return zonas_high, zonas_low
 
+def redondear_centro(centro, base=REDONDEO_BASE):
+    return round(centro / base) * base
+
 def seleccionar_mejores_zonas_spot(zonas_high, zonas_low, precio):
     arriba = [z for z in zonas_high if z["centro"] > precio] + [z for z in zonas_low if z["centro"] > precio]
     abajo = [z for z in zonas_low if z["centro"] < precio] + [z for z in zonas_high if z["centro"] < precio]
@@ -173,9 +173,11 @@ def seleccionar_mejores_zonas_spot(zonas_high, zonas_low, precio):
     for z in arriba:
         z["distancia"] = z["centro"] - precio
         z["score"] = z["toques"] * 1000 - z["distancia"]
+        z["centro_rd"] = redondear_centro(z["centro"])
     for z in abajo:
         z["distancia"] = precio - z["centro"]
         z["score"] = z["toques"] * 1000 - z["distancia"]
+        z["centro_rd"] = redondear_centro(z["centro"])
 
     arriba.sort(key=lambda x: x["score"], reverse=True)
     abajo.sort(key=lambda x: x["score"], reverse=True)
@@ -184,17 +186,11 @@ def seleccionar_mejores_zonas_spot(zonas_high, zonas_low, precio):
     mejor_abajo = abajo[0] if abajo else None
     return mejor_arriba, mejor_abajo
 
-def redondear_centro(centro, base=REDONDEO_BASE):
-    return round(centro / base) * base
-
 # =========================
 # FUNCIONES PARA OPEN INTEREST (FUTUROS)
 # =========================
 
 def obtener_open_interest_hist(period="5m", limit=100):
-    """
-    Obtiene historial de Open Interest de Binance Futures.
-    """
     url = "https://fapi.binance.com/futures/data/openInterestHist"
     params = {
         "symbol": SYMBOL,
@@ -212,11 +208,7 @@ def obtener_open_interest_hist(period="5m", limit=100):
         print(f"Error obteniendo Open Interest: {e}")
         return pd.DataFrame()
 
-def cluster_oi_por_precio(eventos_oi):
-    """
-    Agrupa eventos de OI por precio cercano (usando OI_CLUSTER_RANGE)
-    y calcula el OI total acumulado por cluster.
-    """
+def cluster_oi_por_precio(eventos_oi, precio_actual):
     clusters = []
     for ev in sorted(eventos_oi, key=lambda x: x["precio"]):
         agregado = False
@@ -237,53 +229,32 @@ def cluster_oi_por_precio(eventos_oi):
                 "min": ev["precio"],
                 "max": ev["precio"]
             })
-    # Ordenar por OI total
     clusters.sort(key=lambda x: x["oi_total"], reverse=True)
     return clusters
 
 def detectar_zonas_oi(df_oi, precio_actual):
-    """
-    Analiza el historial de OI y detecta zonas de acumulación.
-    Considera picos individuales y acumulados en ventana OI_LOOKBACK.
-    """
     if df_oi.empty or len(df_oi) < OI_LOOKBACK + 1:
         return None, None
 
     eventos_oi = []
-
-    # Detectar picos individuales
-    for i in range(1, len(df_oi)):
-        oi_actual = float(df_oi.iloc[i]["sumOpenInterestValue"])
-        oi_anterior = float(df_oi.iloc[i-1]["sumOpenInterestValue"])
-        incremento = oi_actual - oi_anterior
-        if incremento > OI_SURGE_THRESHOLD:
-            eventos_oi.append({
-                "precio": precio_actual,  # simplificado, se podría mejorar con lookup de precio
-                "oi_incremento": incremento,
-                "timestamp": df_oi.iloc[i]["timestamp"]
-            })
-
-    # Detectar acumulados en ventana
     for i in range(OI_LOOKBACK, len(df_oi)):
-        suma = 0
+        suma_incrementos = 0
         for j in range(i - OI_LOOKBACK + 1, i + 1):
-            oi_act = float(df_oi.iloc[j]["sumOpenInterestValue"])
-            oi_ant = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
-            suma += max(0, oi_act - oi_ant)
-        if suma > OI_ACCUMULATED_THRESHOLD:
+            oi_actual = float(df_oi.iloc[j]["sumOpenInterestValue"])
+            oi_anterior = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
+            suma_incrementos += max(0, oi_actual - oi_anterior)
+        if suma_incrementos > OI_ACCUMULATED_THRESHOLD:
             eventos_oi.append({
-                "precio": precio_actual,
-                "oi_incremento": suma,
+                "precio": precio_actual,  # simplificado, se podría mejorar con lookup
+                "oi_incremento": suma_incrementos,
                 "timestamp": df_oi.iloc[i]["timestamp"]
             })
 
     if not eventos_oi:
         return None, None
 
-    # Agrupar por precio
-    clusters = cluster_oi_por_precio(eventos_oi)
+    clusters = cluster_oi_por_precio(eventos_oi, precio_actual)
 
-    # Asignar nivel de confianza
     for c in clusters:
         if c["oi_total"] > OI_CONFIANZA_ALTA:
             c["confianza"] = "🔥🔥🔥"
@@ -292,11 +263,9 @@ def detectar_zonas_oi(df_oi, precio_actual):
         else:
             c["confianza"] = "🔥"
 
-    # Separar arriba/abajo según el centro del cluster respecto al precio actual
     arriba = [c for c in clusters if c["centro"] > precio_actual]
     abajo = [c for c in clusters if c["centro"] < precio_actual]
 
-    # Ordenar por OI total
     arriba.sort(key=lambda x: x["oi_total"], reverse=True)
     abajo.sort(key=lambda x: x["oi_total"], reverse=True)
 
@@ -305,95 +274,120 @@ def detectar_zonas_oi(df_oi, precio_actual):
     return mejor_arriba, mejor_abajo
 
 # =========================
-# RADAR 1 (NUEVO CON PRIORIDAD OI)
+# RADAR 1 (NUEVO CON PRIORIDAD OI Y DISTANCIA ≥1%)
 # =========================
 
 def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora):
-    """
-    Envía alerta de liquidez priorizando datos de futuros (OI).
-    Incluye contexto de spot resumido y guarda las últimas zonas para coherencia con Radar 2.
-    """
     global ultima_zona_arriba, ultima_zona_abajo
 
-    # Prioridad: si hay zona OI arriba, la mostramos; si no, usamos spot
-    if mejor_zona_oi_arriba:
+    # Función auxiliar para calcular distancia
+    def distancia(zona, precio):
+        return abs(zona["centro"] - precio) / precio
+
+    # Prioridad OI
+    if mejor_zona_oi_arriba and distancia(mejor_zona_oi_arriba, precio) >= RADAR1_MIN_DIST:
         zona = mejor_zona_oi_arriba
         titulo = f"⚡ RADAR 1 – LIQUIDEZ FUTUROS ARRIBA 🟣"
-        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])}"
+        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])} (centro {fmt(zona['centro'])})"
         oi_valor = zona['oi_total'] / 1_000_000
         confianza = zona['confianza']
         linea_oi = f"OI acumulado: +{oi_valor:.1f}M USD {confianza}"
-        
-        # Contexto spot (si existe)
-        contexto_spot = ""
-        if mejor_zona_spot_arriba:
-            dist = abs(mejor_zona_spot_arriba['centro'] - precio) / precio * 100
-            contexto_spot = f"\n📊 Spot: {mejor_zona_spot_arriba['toques']} toques en {fmt(mejor_zona_spot_arriba['centro'])} ({dist:.1f}%)"
-        
+        dist = distancia(zona, precio) * 100
         msg = f"{titulo}\n\n"
-        msg += f"Zona principal: {rango}\n"
-        msg += f"{linea_oi}\n"
-        msg += contexto_spot
-        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}"
-        enviar(msg)
-        ultima_zona_arriba = zona['centro']
-
-    elif mejor_zona_spot_arriba:
-        titulo = f"💰 RADAR 1 – LIQUIDEZ SPOT ARRIBA 🟢"
-        # Mostrar rango en lugar de un solo punto
-        rango = f"{fmt(mejor_zona_spot_arriba['min'])} - {fmt(mejor_zona_spot_arriba['max'])}"
-        dist = abs(mejor_zona_spot_arriba['centro'] - precio) / precio * 100
-        msg = f"{titulo}\n\n"
-        msg += f"Zona: {rango} (centro {fmt(mejor_zona_spot_arriba['centro'])})\n"
+        msg += f"Zona: {rango}\n"
         msg += f"Distancia: {dist:.1f}%\n"
-        msg += f"{mejor_zona_spot_arriba['toques']} toques{' 🔥' if mejor_zona_spot_arriba['toques'] >= 5 else ''}"
-        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}"
+        msg += f"{linea_oi}\n"
+        msg += f"\nPrecio actual: {fmt(precio)} | Hora: {hora}"
         enviar(msg)
-        ultima_zona_arriba = mejor_zona_spot_arriba['centro']
-    else:
-        ultima_zona_arriba = None
+        ultima_zona_arriba = zona["centro"]
 
-    if mejor_zona_oi_abajo:
+    if mejor_zona_oi_abajo and distancia(mejor_zona_oi_abajo, precio) >= RADAR1_MIN_DIST:
         zona = mejor_zona_oi_abajo
         titulo = f"⚡ RADAR 1 – LIQUIDEZ FUTUROS ABAJO 🔵"
-        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])}"
+        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])} (centro {fmt(zona['centro'])})"
         oi_valor = zona['oi_total'] / 1_000_000
         confianza = zona['confianza']
         linea_oi = f"OI acumulado: +{oi_valor:.1f}M USD {confianza}"
-        
-        contexto_spot = ""
-        if mejor_zona_spot_abajo:
-            dist = abs(mejor_zona_spot_abajo['centro'] - precio) / precio * 100
-            contexto_spot = f"\n📊 Spot: {mejor_zona_spot_abajo['toques']} toques en {fmt(mejor_zona_spot_abajo['centro'])} ({dist:.1f}%)"
-        
+        dist = distancia(zona, precio) * 100
         msg = f"{titulo}\n\n"
-        msg += f"Zona principal: {rango}\n"
-        msg += f"{linea_oi}\n"
-        msg += contexto_spot
-        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}"
-        enviar(msg)
-        ultima_zona_abajo = zona['centro']
-
-    elif mejor_zona_spot_abajo:
-        titulo = f"💰 RADAR 1 – LIQUIDEZ SPOT ABAJO 🔴"
-        rango = f"{fmt(mejor_zona_spot_abajo['min'])} - {fmt(mejor_zona_spot_abajo['max'])}"
-        dist = abs(mejor_zona_spot_abajo['centro'] - precio) / precio * 100
-        msg = f"{titulo}\n\n"
-        msg += f"Zona: {rango} (centro {fmt(mejor_zona_spot_abajo['centro'])})\n"
+        msg += f"Zona: {rango}\n"
         msg += f"Distancia: {dist:.1f}%\n"
-        msg += f"{mejor_zona_spot_abajo['toques']} toques{' 🔥' if mejor_zona_spot_abajo['toques'] >= 5 else ''}"
-        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}"
+        msg += f"{linea_oi}\n"
+        msg += f"\nPrecio actual: {fmt(precio)} | Hora: {hora}"
         enviar(msg)
-        ultima_zona_abajo = mejor_zona_spot_abajo['centro']
-    else:
-        ultima_zona_abajo = None
+        ultima_zona_abajo = zona["centro"]
+
+    # Si no hay OI, usar spot con distancia ≥1%
+    if not mejor_zona_oi_arriba and mejor_zona_spot_arriba and distancia(mejor_zona_spot_arriba, precio) >= RADAR1_MIN_DIST:
+        zona = mejor_zona_spot_arriba
+        titulo = f"💰 RADAR 1 – LIQUIDEZ SPOT ARRIBA 🟢"
+        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])} (centro {fmt(zona['centro'])})"
+        dist = distancia(zona, precio) * 100
+        msg = f"{titulo}\n\n"
+        msg += f"Zona: {rango}\n"
+        msg += f"Distancia: {dist:.1f}%\n"
+        msg += f"{zona['toques']} toques{' 🔥' if zona['toques'] >= 5 else ''}\n"
+        msg += f"\nPrecio actual: {fmt(precio)} | Hora: {hora}"
+        enviar(msg)
+        ultima_zona_arriba = zona["centro"]
+
+    if not mejor_zona_oi_abajo and mejor_zona_spot_abajo and distancia(mejor_zona_spot_abajo, precio) >= RADAR1_MIN_DIST:
+        zona = mejor_zona_spot_abajo
+        titulo = f"💰 RADAR 1 – LIQUIDEZ SPOT ABAJO 🔴"
+        rango = f"{fmt(zona['min'])} - {fmt(zona['max'])} (centro {fmt(zona['centro'])})"
+        dist = distancia(zona, precio) * 100
+        msg = f"{titulo}\n\n"
+        msg += f"Zona: {rango}\n"
+        msg += f"Distancia: {dist:.1f}%\n"
+        msg += f"{zona['toques']} toques{' 🔥' if zona['toques'] >= 5 else ''}\n"
+        msg += f"\nPrecio actual: {fmt(precio)} | Hora: {hora}"
+        enviar(msg)
+        ultima_zona_abajo = zona["centro"]
 
 # =========================
-# RADARES 0,2,3,4
+# RADAR 2 (PROXIMIDAD ENTRE 0.3% Y 1%, SOLO ZONAS PRINCIPALES)
+# =========================
+
+def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
+    global last_event_time
+
+    # Solo considerar si la zona coincide con la última de Radar 1 (dentro de una tolerancia)
+    if ultima_zona_arriba is not None:
+        if mejor_zona_arriba and abs(mejor_zona_arriba["centro"] - ultima_zona_arriba) / ultima_zona_arriba > 0.001:  # 0.1% tolerancia
+            mejor_zona_arriba = None
+    if ultima_zona_abajo is not None:
+        if mejor_zona_abajo and abs(mejor_zona_abajo["centro"] - ultima_zona_abajo) / ultima_zona_abajo > 0.001:
+            mejor_zona_abajo = None
+
+    ahora = datetime.now(UTC)
+
+    def check_and_send(zona, color_emoji, tipo):
+        key = (redondear_centro(zona["centro"]), tipo)
+        dist = abs(zona["centro"] - precio) / precio
+        # Solo enviar si la distancia está entre 0.3% y 1%
+        if PROXIMITY <= dist < RADAR1_MIN_DIST:
+            ultimo = alerted_proximidad.get(key)
+            if ultimo is None or (ahora - ultimo) > timedelta(minutes=RADAR2_COOLDOWN_MINUTOS):
+                alerted_proximidad[key] = ahora
+                nivel_str = f"{fmt(zona['centro'])} ({dist*100:.1f}%)"
+                titulo = f"🔍 Radar 2 – CERCA {nivel_str} {color_emoji}"
+                msg = f"{titulo}\n\n"
+                msg += f"Precio: {fmt(precio)} | Hora: {hora}"
+                enviar(msg)
+                last_event_time = ahora
+                return True
+        return False
+
+    if mejor_zona_arriba:
+        check_and_send(mejor_zona_arriba, "🟢", "HIGH")
+    if mejor_zona_abajo:
+        check_and_send(mejor_zona_abajo, "🔴", "LOW")
+
+# =========================
+# RADAR 0 (IMPULSO)
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
-    """🚀 Radar 0 - Impulso (basado en variación ≥0.65%) + estadísticas de volumen"""
     global last_impulse_time, last_event_time
     if df_entry.empty or len(df_entry) < 3:
         return
@@ -463,46 +457,11 @@ def obtener_probabilidad(volumen, umbrales, probabilidades):
     else:
         return None
 
-def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
-    """
-    🔍 Radar 2 – CERCA.
-    Solo alerta si la zona coincide con la última enviada por Radar 1 (con tolerancia 0.1%).
-    """
-    global last_event_time
-
-    # Filtrar por coherencia con Radar 1
-    if ultima_zona_arriba is not None:
-        if mejor_zona_arriba and abs(mejor_zona_arriba["centro"] - ultima_zona_arriba) / ultima_zona_arriba > 0.001:
-            mejor_zona_arriba = None
-    if ultima_zona_abajo is not None:
-        if mejor_zona_abajo and abs(mejor_zona_abajo["centro"] - ultima_zona_abajo) / ultima_zona_abajo > 0.001:
-            mejor_zona_abajo = None
-
-    ahora = datetime.now(UTC)
-
-    def check_and_send(zona, color_emoji, tipo):
-        key = (redondear_centro(zona["centro"]), tipo)
-        dist = abs(zona["centro"] - precio) / precio
-        if dist < PROXIMITY:
-            ultimo = alerted_proximidad.get(key)
-            if ultimo is None or (ahora - ultimo) > timedelta(minutes=RADAR2_COOLDOWN_MINUTOS):
-                alerted_proximidad[key] = ahora
-                nivel_str = f"{fmt(zona['centro'])} ({dist*100:.1f}%)"
-                titulo = f"🔍 Radar 2 – CERCA {nivel_str} {color_emoji}"
-                msg = f"{titulo}\n\n"
-                msg += f"Precio: {fmt(precio)} | Hora: {hora}"
-                enviar(msg)
-                last_event_time = ahora
-                return True
-        return False
-
-    if mejor_zona_arriba:
-        check_and_send(mejor_zona_arriba, "🟢", "HIGH")
-    if mejor_zona_abajo:
-        check_and_send(mejor_zona_abajo, "🔴", "LOW")
+# =========================
+# RADAR 3 (SWEEP)
+# =========================
 
 def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual):
-    """🔄 Radar 3 – SWEEP (sin cambios)"""
     global sweep_pendiente, last_event_time
     if df_entry.empty or len(df_entry) < 2:
         return
@@ -532,15 +491,18 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual):
         return
     vela_anterior = df_entry.iloc[-2]
     vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-    if mejor_zona_arriba and mejor_zona_arriba.get("tipo") == "HIGH" and vela_anterior["high"] > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) and vela_anterior["close"] < mejor_zona_arriba["centro"]:
+    if mejor_zona_arriba and vela_anterior["high"] > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) and vela_anterior["close"] < mejor_zona_arriba["centro"]:
         if vela_anterior["volume"] > vol_medio * 1.5:
             sweep_pendiente = (mejor_zona_arriba, "HIGH")
-    elif mejor_zona_abajo and mejor_zona_abajo.get("tipo") == "LOW" and vela_anterior["low"] < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) and vela_anterior["close"] > mejor_zona_abajo["centro"]:
+    elif mejor_zona_abajo and vela_anterior["low"] < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) and vela_anterior["close"] > mejor_zona_abajo["centro"]:
         if vela_anterior["volume"] > vol_medio * 1.5:
             sweep_pendiente = (mejor_zona_abajo, "LOW")
 
+# =========================
+# RADAR 4 (BREAKOUT)
+# =========================
+
 def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual):
-    """🌋 Radar 4 – BREAKOUT (sin cambios)"""
     global zona_consumida, last_event_time, alerted_liquidity
     if df_entry.empty:
         return
@@ -582,7 +544,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.1)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -599,7 +561,7 @@ def sin_eventos():
         last_event_time = ahora
 
 # =========================
-# FUNCIÓN PRINCIPAL DE EVALUACIÓN
+# FUNCIÓN PRINCIPAL
 # =========================
 
 def evaluar():
@@ -608,33 +570,31 @@ def evaluar():
     ahora = datetime.now(UTC)
     hora_str = ahora.strftime('%H:%M')
 
-    # Obtener datos
     df_spot = obtener_candles_spot(INTERVAL_MACRO)
     df_entry = obtener_candles_spot(INTERVAL_ENTRY)
-    df_oi = obtener_open_interest_hist(period="5m", limit=50)  # Suficiente para detectar acumulados
+    df_oi = obtener_open_interest_hist(period="5m", limit=OI_LOOKBACK*3)
     precio = obtener_precio_actual()
 
     if df_entry.empty or precio is None:
         return
 
-    # Detectar zonas spot (toques)
+    # Detectar zonas spot
     zonas_high_spot, zonas_low_spot = detectar_zonas_spot(df_spot) if not df_spot.empty else ([], [])
     mejor_spot_arriba, mejor_spot_abajo = seleccionar_mejores_zonas_spot(zonas_high_spot, zonas_low_spot, precio)
 
-    # Detectar zonas OI (futuros)
+    # Detectar zonas OI
     mejor_oi_arriba, mejor_oi_abajo = detectar_zonas_oi(df_oi, precio) if not df_oi.empty else (None, None)
 
-    # Definir zona actual para el bot (prioridad OI)
+    # Definir zona actual (prioridad OI)
     centro_arriba = mejor_oi_arriba["centro"] if mejor_oi_arriba else (mejor_spot_arriba["centro"] if mejor_spot_arriba else None)
     centro_abajo = mejor_oi_abajo["centro"] if mejor_oi_abajo else (mejor_spot_abajo["centro"] if mejor_spot_abajo else None)
     nueva_zona = (centro_arriba, centro_abajo)
 
-    # Si la zona cambió (o no hay OI y cambia spot), enviamos Radar 1 con cooldown
+    # Enviar Radar 1 si cambia la zona (con cooldown)
     if nueva_zona != zona_actual:
         zona_actual = nueva_zona
         zona_consumida = False
         alerted_liquidity.clear()
-        # No limpiamos alerted_proximidad para mantener cooldown
         if last_mapa_time is None or (ahora - last_mapa_time) > timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
             enviar_liquidez_detectada(mejor_oi_arriba, mejor_oi_abajo, mejor_spot_arriba, mejor_spot_abajo, precio, hora_str)
             last_mapa_time = ahora
@@ -648,7 +608,7 @@ def evaluar():
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
 
-    # Para los radares 2,3,4, usamos las zonas de OI si existen; si no, las de spot
+    # Zonas de referencia para radares (prioridad OI)
     zona_ref_arriba = mejor_oi_arriba if mejor_oi_arriba else mejor_spot_arriba
     zona_ref_abajo = mejor_oi_abajo if mejor_oi_abajo else mejor_spot_abajo
 
@@ -673,7 +633,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.1 (con Open Interest mejorado)...")
+    print("🚀 Iniciando BOT V11.1 (con umbrales ajustados)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.1)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"

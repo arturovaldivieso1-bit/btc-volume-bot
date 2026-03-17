@@ -357,11 +357,16 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
 def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
     global last_event_time
 
-    # Solo considerar si coincide con la última zona de Radar 1 (tolerancia 0.1%)
-    if ultima_zona_arriba is not None:
+    # Filtrar: solo zonas que coincidan con la última de Radar 1
+    if ultima_zona_arriba is None:
+        mejor_zona_arriba = None
+    else:
         if mejor_zona_arriba and abs(mejor_zona_arriba["centro"] - ultima_zona_arriba) / ultima_zona_arriba > 0.001:
             mejor_zona_arriba = None
-    if ultima_zona_abajo is not None:
+
+    if ultima_zona_abajo is None:
+        mejor_zona_abajo = None
+    else:
         if mejor_zona_abajo and abs(mejor_zona_abajo["centro"] - ultima_zona_abajo) / ultima_zona_abajo > 0.001:
             mejor_zona_abajo = None
 
@@ -377,7 +382,6 @@ def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
             ultimo = alerted_proximidad.get(key)
             if ultimo is None or (ahora - ultimo) > timedelta(minutes=RADAR2_COOLDOWN_MINUTOS):
                 alerted_proximidad[key] = ahora
-                # Mostrar centro redondeado
                 titulo = f"🔍 Radar 2 – CERCA {fmt(centro_rd)} ({dist*100:.1f}%) {color_emoji}"
                 msg = f"{titulo}\n\nPrecio: {fmt(precio)} | Hora: {hora}"
                 enviar(msg)
@@ -561,7 +565,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.2)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -662,10 +666,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.2 (con mejoras de coherencia y OI)...")
+    print("🚀 Iniciando BOT V11.3 (con mejoras en Radar 2)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.2)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)

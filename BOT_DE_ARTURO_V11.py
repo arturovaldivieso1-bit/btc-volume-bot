@@ -27,7 +27,7 @@ RADAR1_MIN_DIST = 0.01         # 1% umbral mínimo para enviar Radar 1
 ZONA_EQUIVALENTE = 0.01        # 1% para considerar misma zona (evita spam)
 
 # Parámetros de Open Interest (futuros) - más sensibles
-OI_SURGE_THRESHOLD = 10_000_000        # $10M (pico individual)
+OI_SURGE_THRESHOLD = 10_000_000        # $10M (pico individual) - no usado actualmente
 OI_ACCUMULATED_THRESHOLD = 20_000_000  # $20M acumulado en 3 velas
 OI_LOOKBACK = 3
 OI_CLUSTER_RANGE = 0.002               # 0.2% para agrupar zonas de OI
@@ -213,7 +213,7 @@ def misma_zona(z1, z2):
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
 # =========================
-# FUNCIONES PARA OPEN INTEREST (FUTUROS)
+# FUNCIONES PARA OPEN INTEREST (FUTUROS) CON LOGS
 # =========================
 
 def obtener_open_interest_hist(period="5m", limit=100):
@@ -224,14 +224,16 @@ def obtener_open_interest_hist(period="5m", limit=100):
         "limit": limit
     }
     try:
+        print(f"\n[LOG] Solicitando OI a Binance Futures...")
         data = requests.get(url, params=params, timeout=10).json()
         df = pd.DataFrame(data)
+        print(f"[LOG] Respuesta recibida. {len(df)} registros.")
         df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"])
         df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
         return df
     except Exception as e:
-        print(f"Error obteniendo Open Interest: {e}")
+        print(f"[LOG] Error obteniendo Open Interest: {e}")
         return pd.DataFrame()
 
 def cluster_oi_por_precio(eventos_oi):
@@ -263,7 +265,9 @@ def detectar_zonas_oi(df_oi, df_spot):
     Retorna una lista de clusters de OI (cada cluster es un dict con centro, min, max, oi_total, confianza)
     Si no hay datos, retorna lista vacía.
     """
+    print(f"\n🔍 [LOG detectar_zonas_oi] Inicio. df_oi shape: {df_oi.shape if not df_oi.empty else 'vacío'}")
     if df_oi.empty or len(df_oi) < OI_LOOKBACK + 1:
+        print("   ⚠️ [LOG] datos insuficientes, retornando []")
         return []
 
     eventos_oi = []
@@ -272,15 +276,17 @@ def detectar_zonas_oi(df_oi, df_spot):
         for j in range(i - OI_LOOKBACK + 1, i + 1):
             oi_actual = float(df_oi.iloc[j]["sumOpenInterestValue"])
             oi_anterior = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
-            suma_incrementos += max(0, oi_actual - oi_anterior)
+            incremento = max(0, oi_actual - oi_anterior)
+            suma_incrementos += incremento
+        print(f"   [LOG] i={i}, suma_incrementos={suma_incrementos/1e6:.2f}M USD, umbral={OI_ACCUMULATED_THRESHOLD/1e6:.2f}M")
         if suma_incrementos > OI_ACCUMULATED_THRESHOLD:
-            # Asociar al precio de la vela spot más cercana en el tiempo
             ts = df_oi.iloc[i]["timestamp"]
             precio_zona = None
             if not df_spot.empty and 'time' in df_spot.columns:
                 df_spot['time_dt'] = pd.to_datetime(df_spot['time'], unit='ms')
                 idx = (df_spot['time_dt'] - ts).abs().idxmin()
                 precio_zona = df_spot.loc[idx, 'close']
+                print(f"      ✅ [LOG] Pico detectado! precio_asociado={precio_zona}")
             if precio_zona:
                 eventos_oi.append({
                     "precio": precio_zona,
@@ -288,10 +294,14 @@ def detectar_zonas_oi(df_oi, df_spot):
                     "timestamp": ts
                 })
 
+    print(f"   [LOG] Total eventos_oi: {len(eventos_oi)}")
     if not eventos_oi:
         return []
 
     clusters = cluster_oi_por_precio(eventos_oi)
+    print(f"   [LOG] Total clusters: {len(clusters)}")
+    for idx, c in enumerate(clusters):
+        print(f"      cluster {idx}: centro={c['centro']:.0f}, min={c['min']:.0f}, max={c['max']:.0f}, oi_total={c['oi_total']/1e6:.2f}M")
 
     for c in clusters:
         if c["oi_total"] > OI_CONFIANZA_ALTA:
@@ -565,7 +575,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3 con logs)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -666,10 +676,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.3 (con mejoras en Radar 2)...")
+    print("🚀 Iniciando BOT V11.3 con logs de depuración...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3 con logs)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)
@@ -680,7 +690,7 @@ if __name__ == "__main__":
         try:
             evaluar()
         except Exception as e:
-            print(f"Error en ciclo principal: {e}")
+            print(f"❌ Error en ciclo principal: {e}")
             enviar(f"⚠️ ERROR: {str(e)[:100]}")
             time.sleep(60)
         time.sleep(60)

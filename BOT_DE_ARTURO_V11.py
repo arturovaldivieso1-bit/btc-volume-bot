@@ -259,8 +259,12 @@ def cluster_oi_por_precio(eventos_oi):
     return clusters
 
 def detectar_zonas_oi(df_oi, df_spot):
+    """
+    Retorna una lista de clusters de OI (cada cluster es un dict con centro, min, max, oi_total, confianza)
+    Si no hay datos, retorna lista vacía.
+    """
     if df_oi.empty or len(df_oi) < OI_LOOKBACK + 1:
-        return None, None
+        return []
 
     eventos_oi = []
     for i in range(OI_LOOKBACK, len(df_oi)):
@@ -272,12 +276,11 @@ def detectar_zonas_oi(df_oi, df_spot):
         if suma_incrementos > OI_ACCUMULATED_THRESHOLD:
             # Asociar al precio de la vela spot más cercana en el tiempo
             ts = df_oi.iloc[i]["timestamp"]
+            precio_zona = None
             if not df_spot.empty and 'time' in df_spot.columns:
                 df_spot['time_dt'] = pd.to_datetime(df_spot['time'], unit='ms')
                 idx = (df_spot['time_dt'] - ts).abs().idxmin()
                 precio_zona = df_spot.loc[idx, 'close']
-            else:
-                precio_zona = None  # No se puede determinar
             if precio_zona:
                 eventos_oi.append({
                     "precio": precio_zona,
@@ -286,7 +289,7 @@ def detectar_zonas_oi(df_oi, df_spot):
                 })
 
     if not eventos_oi:
-        return None, None
+        return []
 
     clusters = cluster_oi_por_precio(eventos_oi)
 
@@ -298,8 +301,6 @@ def detectar_zonas_oi(df_oi, df_spot):
         else:
             c["confianza"] = "🔥"
 
-    # Necesitamos precio actual para separar arriba/abajo, pero aquí no lo tenemos.
-    # Esta función devolverá todos los clusters y luego en evaluar se separará con precio_actual.
     return clusters
 
 # =========================
@@ -367,6 +368,8 @@ def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
     ahora = datetime.now(UTC)
 
     def check_and_send(zona, color_emoji, tipo):
+        if zona is None:
+            return False
         centro_rd = redondear_centro(zona["centro"])
         key = (centro_rd, tipo)
         dist = distancia(zona, precio)

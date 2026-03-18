@@ -42,6 +42,10 @@ SPOT_FUTUROS_TOLERANCIA = 0.005  # 0.5%
 IMPULSE_PRICE_CHANGE = 0.65
 IMPULSE_COOLDOWN = 300
 
+# Radar 3 - Sweep
+SWEEP_VOLUME_FACTOR = 1.5        # Multiplicador de volumen respecto a la media
+SWEEP_BREAK_MARGIN = 0.001        # 0.1% de margen para considerar ruptura (reduce falsos)
+
 # Umbrales de volumen para probabilidades (estudio)
 VOL1_MED = 400
 VOL1_P75 = 692
@@ -335,13 +339,12 @@ def detectar_zonas_oi(df_oi, df_spot):
     return clusters
 
 # =========================
-# RADAR 1 (CON ÍCONOS: 💰 SPOT, 🧲 FUTUROS, COLOR EN DIRECCIÓN, SIN PALABRA "RANGO")
+# RADAR 1
 # =========================
 
 def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora):
     global ultima_zona_arriba, ultima_zona_abajo
 
-    # Función para enviar una zona
     def enviar_zona(zona, tipo, es_oi, zonas_spot_referencia=None):
         if es_oi:
             icono = "🧲"
@@ -349,12 +352,10 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
             confianza = zona.get('confianza', '')
             oi_valor = zona['oi_total'] / 1_000_000
             linea_extra = f"OI acumulado: +{oi_valor:.1f}M USD {confianza}"
-            # Verificar si hay zona spot cercana para validar
             validacion = ""
             if zonas_spot_referencia:
-                # Buscar si algún cluster spot está cerca
                 for zs in zonas_spot_referencia:
-                    if abs(zona['centro'] - zs['centro']) / zona['centro'] < SPOT_FUTUROS_TOLERANCIA:
+                    if zs and abs(zona['centro'] - zs['centro']) / zona['centro'] < SPOT_FUTUROS_TOLERANCIA:
                         validacion = "\n✅ Confirmado por spot"
                         break
         else:
@@ -367,7 +368,6 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         color_direccion = "🟢" if tipo == "HIGH" else "🔴"
 
         centro = fmt(zona['centro'])
-        # Sin palabra "rango", solo números
         rango = f"{fmt(zona['min'])}-{fmt(zona['max'])}"
         dist = distancia(zona, precio) * 100
         msg = f"{icono} RADAR 1 – LIQUIDEZ {fuente} {color_direccion} {direccion_texto}\n\n"
@@ -380,7 +380,6 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         enviar(msg)
         print(f"[LOG ENVÍO] {icono} RADAR 1 – {fuente} {direccion_texto} - centro {centro} - distancia {dist:.1f}%")
 
-    # Para futuros: enviar siempre que existan
     if mejor_zona_oi_arriba:
         enviar_zona(mejor_zona_oi_arriba, "HIGH", True, [mejor_zona_spot_arriba] if mejor_zona_spot_arriba else None)
         ultima_zona_arriba = mejor_zona_oi_arriba["centro"]
@@ -400,7 +399,7 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         ultima_zona_abajo = None
 
 # =========================
-# RADAR 2 (PROXIMIDAD) - Mantiene lupa 🔍
+# RADAR 2
 # =========================
 
 def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
@@ -438,7 +437,7 @@ def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
         check_and_send(mejor_zona_abajo, "🔴", "LOW")
 
 # =========================
-# RADAR 0 (IMPULSO)
+# RADAR 0
 # =========================
 
 def radar_impulse(df_entry, precio_actual):
@@ -519,7 +518,7 @@ def obtener_probabilidad(volumen, umbrales, probabilidades):
         return None
 
 # =========================
-# RADAR 3 (SWEEP)
+# RADAR 3 (SWEEP con margen de ruptura)
 # =========================
 
 def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual):
@@ -552,11 +551,13 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual):
         return
     vela_anterior = df_entry.iloc[-2]
     vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-    if mejor_zona_arriba and vela_anterior["high"] > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) and vela_anterior["close"] < mejor_zona_arriba["centro"]:
-        if vela_anterior["volume"] > vol_medio * 1.5:
+
+    # Condiciones con margen de ruptura
+    if mejor_zona_arriba and vela_anterior["high"] > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) * (1 + SWEEP_BREAK_MARGIN) and vela_anterior["close"] < mejor_zona_arriba["centro"]:
+        if vela_anterior["volume"] > vol_medio * SWEEP_VOLUME_FACTOR:
             sweep_pendiente = (mejor_zona_arriba, "HIGH")
-    elif mejor_zona_abajo and vela_anterior["low"] < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) and vela_anterior["close"] > mejor_zona_abajo["centro"]:
-        if vela_anterior["volume"] > vol_medio * 1.5:
+    elif mejor_zona_abajo and vela_anterior["low"] < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) * (1 - SWEEP_BREAK_MARGIN) and vela_anterior["close"] > mejor_zona_abajo["centro"]:
+        if vela_anterior["volume"] > vol_medio * SWEEP_VOLUME_FACTOR:
             sweep_pendiente = (mejor_zona_abajo, "LOW")
 
 # =========================
@@ -605,7 +606,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.5)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.6)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -691,10 +692,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.5 (con íconos imán, colores en dirección, validación spot+futuros)...")
+    print("🚀 Iniciando BOT V11.6 (con margen de ruptura en Radar 3)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.5)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.6)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)

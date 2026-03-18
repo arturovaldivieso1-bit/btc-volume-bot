@@ -27,9 +27,9 @@ PROXIMITY = 0.003              # 0.3% umbral inferior para Radar 2
 RADAR1_MIN_DIST = 0.01         # 1% umbral mínimo para enviar Radar 1 (solo spot, futuros ya no lo usan)
 ZONA_EQUIVALENTE = 0.01        # 1% para considerar misma zona (evita spam)
 
-# Parámetros de Open Interest (futuros) - dinámicos
-OI_WINDOW = 100                 # Ventana para calcular percentiles
-OI_PERCENTILE = 90              # Percentil para considerar un pico significativo
+# Parámetros de Open Interest (futuros) - dinámicos (ajustados)
+OI_WINDOW = 50                  # Ventana para calcular percentiles
+OI_PERCENTILE = 75              # Percentil 75 (más sensible que 90)
 OI_LOOKBACK = 3                  # Velas para acumular incrementos
 OI_CLUSTER_RANGE = 0.002         # 0.2% para agrupar zonas de OI
 OI_CONFIANZA_ALTA = 200_000_000
@@ -295,7 +295,7 @@ def detectar_zonas_oi(df_oi, df_spot):
         oi_increment_history = oi_increment_history[-OI_WINDOW:]
 
     # Calcular umbral dinámico (percentil)
-    umbral_dinamico = np.percentile(oi_increment_history, OI_PERCENTILE) if len(oi_increment_history) >= 10 else OI_ACCUMULATED_THRESHOLD
+    umbral_dinamico = np.percentile(oi_increment_history, OI_PERCENTILE) if len(oi_increment_history) >= 10 else (20_000_000)  # fallback a 20M si hay pocos datos
     print(f"   [LOG] Historial de incrementos: {len(oi_increment_history)} valores, umbral dinámico={umbral_dinamico/1e6:.2f}M USD")
 
     eventos_oi = []
@@ -696,7 +696,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.4 (con lógica Coinglass)...")
+    print("🚀 Iniciando BOT V11.4 (con lógica Coinglass y percentil 75)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.4)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"

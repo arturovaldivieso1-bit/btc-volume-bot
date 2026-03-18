@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import time
 import os
+import numpy as np
 from datetime import datetime, timedelta, UTC
 
 # =========================
@@ -23,14 +24,14 @@ LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025        # 0.25% para agrupar precios
 PROXIMITY = 0.003              # 0.3% umbral inferior para Radar 2
-RADAR1_MIN_DIST = 0.01         # 1% umbral mínimo para enviar Radar 1
+RADAR1_MIN_DIST = 0.01         # 1% umbral mínimo para enviar Radar 1 (solo spot, futuros ya no lo usan)
 ZONA_EQUIVALENTE = 0.01        # 1% para considerar misma zona (evita spam)
 
-# Parámetros de Open Interest (futuros) - más sensibles
-OI_SURGE_THRESHOLD = 10_000_000        # $10M (pico individual) - no usado actualmente
-OI_ACCUMULATED_THRESHOLD = 20_000_000  # $20M acumulado en 3 velas
-OI_LOOKBACK = 3
-OI_CLUSTER_RANGE = 0.002               # 0.2% para agrupar zonas de OI
+# Parámetros de Open Interest (futuros) - dinámicos
+OI_WINDOW = 100                 # Ventana para calcular percentiles
+OI_PERCENTILE = 90              # Percentil para considerar un pico significativo
+OI_LOOKBACK = 3                  # Velas para acumular incrementos
+OI_CLUSTER_RANGE = 0.002         # 0.2% para agrupar zonas de OI
 OI_CONFIANZA_ALTA = 200_000_000
 OI_CONFIANZA_MEDIA = 100_000_000
 
@@ -79,6 +80,9 @@ alerted_proximidad = {}                  # Diccionario {(centro_rd, tipo): times
 sweep_pendiente = None
 ultima_zona_arriba = None               # Centro de la última zona enviada por Radar 1 (arriba)
 ultima_zona_abajo = None                 # Centro de la última zona enviada por Radar 1 (abajo)
+
+# Historial de incrementos de OI para cálculo de percentil
+oi_increment_history = []
 
 # =========================
 # FUNCIONES AUXILIARES (SPOT)
@@ -213,10 +217,10 @@ def misma_zona(z1, z2):
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
 # =========================
-# FUNCIONES PARA OPEN INTEREST (FUTUROS) CON LOGS
+# FUNCIONES PARA OPEN INTEREST (FUTUROS) CON LÓGICA DINÁMICA
 # =========================
 
-def obtener_open_interest_hist(period="5m", limit=100):
+def obtener_open_interest_hist(period="5m", limit=200):
     url = "https://fapi.binance.com/futures/data/openInterestHist"
     params = {
         "symbol": SYMBOL,
@@ -257,18 +261,42 @@ def cluster_oi_por_precio(eventos_oi):
                 "min": ev["precio"],
                 "max": ev["precio"]
             })
+    # Si un cluster tiene solo un punto, ampliar el rango ligeramente para que se vea como zona
+    for c in clusters:
+        if c["min"] == c["max"]:
+            c["min"] = c["centro"] * (1 - OI_CLUSTER_RANGE)
+            c["max"] = c["centro"] * (1 + OI_CLUSTER_RANGE)
     clusters.sort(key=lambda x: x["oi_total"], reverse=True)
     return clusters
 
 def detectar_zonas_oi(df_oi, df_spot):
     """
     Retorna una lista de clusters de OI (cada cluster es un dict con centro, min, max, oi_total, confianza)
-    Si no hay datos, retorna lista vacía.
+    Utiliza un umbral dinámico basado en percentiles.
     """
+    global oi_increment_history
+
     print(f"\n🔍 [LOG detectar_zonas_oi] Inicio. df_oi shape: {df_oi.shape if not df_oi.empty else 'vacío'}")
     if df_oi.empty or len(df_oi) < OI_LOOKBACK + 1:
         print("   ⚠️ [LOG] datos insuficientes, retornando []")
         return []
+
+    # Calcular incrementos para todas las posiciones y actualizar historial
+    nuevos_incrementos = []
+    for i in range(1, len(df_oi)):
+        oi_actual = float(df_oi.iloc[i]["sumOpenInterestValue"])
+        oi_anterior = float(df_oi.iloc[i-1]["sumOpenInterestValue"])
+        inc = max(0, oi_actual - oi_anterior)
+        nuevos_incrementos.append(inc)
+
+    # Mantener historial (ventana móvil)
+    oi_increment_history.extend(nuevos_incrementos)
+    if len(oi_increment_history) > OI_WINDOW:
+        oi_increment_history = oi_increment_history[-OI_WINDOW:]
+
+    # Calcular umbral dinámico (percentil)
+    umbral_dinamico = np.percentile(oi_increment_history, OI_PERCENTILE) if len(oi_increment_history) >= 10 else OI_ACCUMULATED_THRESHOLD
+    print(f"   [LOG] Historial de incrementos: {len(oi_increment_history)} valores, umbral dinámico={umbral_dinamico/1e6:.2f}M USD")
 
     eventos_oi = []
     for i in range(OI_LOOKBACK, len(df_oi)):
@@ -278,8 +306,8 @@ def detectar_zonas_oi(df_oi, df_spot):
             oi_anterior = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
             incremento = max(0, oi_actual - oi_anterior)
             suma_incrementos += incremento
-        print(f"   [LOG] i={i}, suma_incrementos={suma_incrementos/1e6:.2f}M USD, umbral={OI_ACCUMULATED_THRESHOLD/1e6:.2f}M")
-        if suma_incrementos > OI_ACCUMULATED_THRESHOLD:
+        print(f"   [LOG] i={i}, suma_incrementos={suma_incrementos/1e6:.2f}M USD, umbral={umbral_dinamico/1e6:.2f}M")
+        if suma_incrementos > umbral_dinamico:
             ts = df_oi.iloc[i]["timestamp"]
             precio_zona = None
             if not df_spot.empty and 'time' in df_spot.columns:
@@ -301,7 +329,7 @@ def detectar_zonas_oi(df_oi, df_spot):
     clusters = cluster_oi_por_precio(eventos_oi)
     print(f"   [LOG] Total clusters: {len(clusters)}")
     for idx, c in enumerate(clusters):
-        print(f"      cluster {idx}: centro={c['centro']:.0f}, min={c['min']:.0f}, max={c['max']:.0f}, oi_total={c['oi_total']/1e6:.2f}M")
+        print(f"      cluster {idx}: centro={c['centro']:.0f}, rango={c['min']:.0f}-{c['max']:.0f}, oi_total={c['oi_total']/1e6:.2f}M")
 
     for c in clusters:
         if c["oi_total"] > OI_CONFIANZA_ALTA:
@@ -314,7 +342,7 @@ def detectar_zonas_oi(df_oi, df_spot):
     return clusters
 
 # =========================
-# RADAR 1 (NUEVO CON PRIORIDAD OI Y DISTANCIA ≥1%)
+# RADAR 1 (NUEVO CON PRIORIDAD OI Y SIN FILTRO DE DISTANCIA PARA FUTUROS)
 # =========================
 
 def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora):
@@ -339,9 +367,10 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         msg += f"{linea_extra}\n"
         msg += f"\nPrecio actual: {fmt(precio)} | Hora: {hora}"
         enviar(msg)
+        print(f"[LOG ENVÍO] {titulo} - centro {centro} - distancia {dist:.1f}%")
 
-    # Enviar arriba si existe y distancia >= 1%
-    if mejor_zona_oi_arriba and distancia(mejor_zona_oi_arriba, precio) >= RADAR1_MIN_DIST:
+    # Para futuros: enviar siempre que existan (sin filtro de distancia)
+    if mejor_zona_oi_arriba:
         enviar_zona(mejor_zona_oi_arriba, "HIGH", True)
         ultima_zona_arriba = mejor_zona_oi_arriba["centro"]
     elif mejor_zona_spot_arriba and distancia(mejor_zona_spot_arriba, precio) >= RADAR1_MIN_DIST:
@@ -350,8 +379,7 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
     else:
         ultima_zona_arriba = None
 
-    # Enviar abajo si existe y distancia >= 1%
-    if mejor_zona_oi_abajo and distancia(mejor_zona_oi_abajo, precio) >= RADAR1_MIN_DIST:
+    if mejor_zona_oi_abajo:
         enviar_zona(mejor_zona_oi_abajo, "LOW", True)
         ultima_zona_abajo = mejor_zona_oi_abajo["centro"]
     elif mejor_zona_spot_abajo and distancia(mejor_zona_spot_abajo, precio) >= RADAR1_MIN_DIST:
@@ -367,16 +395,11 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
 def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora):
     global last_event_time
 
-    # Filtrar: solo zonas que coincidan con la última de Radar 1
-    if ultima_zona_arriba is None:
-        mejor_zona_arriba = None
-    else:
+    # Filtrar: solo zonas que coincidan con la última de Radar 1 (tolerancia 0.1%)
+    if ultima_zona_arriba is not None:
         if mejor_zona_arriba and abs(mejor_zona_arriba["centro"] - ultima_zona_arriba) / ultima_zona_arriba > 0.001:
             mejor_zona_arriba = None
-
-    if ultima_zona_abajo is None:
-        mejor_zona_abajo = None
-    else:
+    if ultima_zona_abajo is not None:
         if mejor_zona_abajo and abs(mejor_zona_abajo["centro"] - ultima_zona_abajo) / ultima_zona_abajo > 0.001:
             mejor_zona_abajo = None
 
@@ -414,12 +437,9 @@ def radar_impulse(df_entry, precio_actual):
         return
 
     vela = df_entry.iloc[-1]
-    # Asegurar que los datos son numéricos
     try:
         open_price = float(vela["open"])
         close_price = float(vela["close"])
-        high = float(vela["high"])
-        low = float(vela["low"])
         volume = float(vela["volume"])
     except:
         return
@@ -575,7 +595,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3 con logs)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.4)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -603,7 +623,7 @@ def evaluar():
 
     df_spot_macro = obtener_candles_spot(INTERVAL_MACRO)
     df_entry = obtener_candles_spot(INTERVAL_ENTRY)
-    df_oi = obtener_open_interest_hist(period="5m", limit=OI_LOOKBACK*3)
+    df_oi = obtener_open_interest_hist(period="5m", limit=200)  # Pedimos más datos para el percentil
     precio = obtener_precio_actual()
 
     if df_entry.empty or precio is None:
@@ -676,10 +696,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V11.3 con logs de depuración...")
+    print("🚀 Iniciando BOT V11.4 (con lógica Coinglass)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.3 con logs)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V11.4)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)

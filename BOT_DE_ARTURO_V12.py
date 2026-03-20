@@ -8,7 +8,7 @@ import numpy as np
 from datetime import datetime, timedelta, UTC
 from collections import deque
 import json
-import math
+import threading
 
 # =========================
 # CONFIGURACIÓN INICIAL
@@ -19,29 +19,28 @@ CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTCUSDT"
 
 # Timeframes
-INTERVAL_MACRO = "1h"          # Para estructura de liquidez (spot y bias)
-INTERVAL_ENTRY = "5m"           # Para eventos
-INTERVAL_BIAS = "4h"            # Para tendencia de más largo plazo
+INTERVAL_MACRO = "1h"
+INTERVAL_ENTRY = "5m"
+INTERVAL_BIAS = "4h"
 
 # Parámetros de liquidez spot
 LOOKBACK = 168
 MIN_TOUCHES = 3
-CLUSTER_RANGE = 0.0025          # 0.25% para agrupar precios
-PROXIMITY = 0.003               # 0.3% umbral inferior para Radar 2
-RADAR1_MIN_DIST = 0.01          # 1% umbral mínimo para enviar Radar 1 (solo spot, futuros ya no lo usan)
-ZONA_EQUIVALENTE = 0.01         # 1% para considerar misma zona (evita spam)
+CLUSTER_RANGE = 0.0025
+PROXIMITY = 0.003
+RADAR1_MIN_DIST = 0.01
+ZONA_EQUIVALENTE = 0.01
 
-# Parámetros de Open Interest (futuros) - dinámicos
+# Parámetros de Open Interest (futuros)
 OI_WINDOW = 50
 OI_PERCENTILE = 75
 OI_LOOKBACK = 3
 OI_CLUSTER_RANGE = 0.002
-OI_CONFIANZA_ALTA = 500_000_000   # Ajustado para escalado
+OI_CONFIANZA_ALTA = 500_000_000
 OI_CONFIANZA_MEDIA = 200_000_000
 OI_CONFIANZA_BAJA = 100_000_000
 
-# Tolerancia para validación cruzada spot-futuros
-SPOT_FUTUROS_TOLERANCIA = 0.005   # 0.5%
+SPOT_FUTUROS_TOLERANCIA = 0.005
 
 # Radar 0 - Impulso
 IMPULSE_PRICE_CHANGE = 0.65
@@ -49,33 +48,31 @@ IMPULSE_COOLDOWN = 300
 
 # Radar 3 - Sweep
 SWEEP_VOLUME_FACTOR = 1.5
-SWEEP_BREAK_MARGIN = 0.001        # 0.1%
+SWEEP_BREAK_MARGIN = 0.001
 
 # Radar 4 - Breakout
-BREAKOUT_MARGIN = 0.003           # 0.3%
-BREAKOUT_RETEST_CANDLES = 1       # Número de velas para confirmar retest (0 = sin retest)
+BREAKOUT_MARGIN = 0.003
+BREAKOUT_RETEST_CANDLES = 1
 
 # Sistema de bias y scoring
 EMA_SHORT = 50
 EMA_LONG = 200
-SCORE_UMBRAL_ACCION = 5            # Mínimo score para enviar alerta (sin normalizar aún)
-SCORE_MAX_TEORICO = 30             # Se recalculará automáticamente, pero valor inicial aproximado
+SCORE_UMBRAL_ACCION = 5
+SCORE_MAX_TEORICO = 30
 
-# Pesos base (se pueden ajustar)
 PESOS = {
     "zona_spot": 1,
-    "zona_oi": 2,                  # Se suma el peso escalado aparte
-    "toques_altos": 1,              # si toques >= 5
-    "cercania": 1,                   # si distancia < 0.5%
+    "zona_oi": 2,
+    "toques_altos": 1,
+    "cercania": 1,
     "bias_favorable_tendencia": 3,
-    "bias_favorable_lateral": 2,     # nuevo: favorece sweeps en lateral
+    "bias_favorable_lateral": 2,
     "evento_impulso": 1,
     "evento_sweep": 2,
     "evento_breakout": 2,
     "validacion_spot": 2
 }
 
-# Escalado de OI (mapeo de millones a peso)
 def peso_por_oi(oi_total):
     if oi_total > 500_000_000:
         return 4
@@ -86,7 +83,7 @@ def peso_por_oi(oi_total):
     else:
         return 1
 
-# Umbrales de volumen para probabilidades (estudio) - serán recalibrados
+# Umbrales de volumen (probabilidades)
 VOL1_MED = 400
 VOL1_P75 = 692
 VOL1_P90 = 1134
@@ -115,10 +112,10 @@ MAPA_COOLDOWN_MINUTOS = 60
 RADAR2_COOLDOWN_MINUTOS = 120
 REDONDEO_BASE = 200
 
-# Machine Learning Manual
+# ML Manual
 HISTORIAL_FILE = "historial_eventos.json"
-EVALUACION_VELAS = 12               # Número de velas después del evento para evaluar éxito
-RANGO_EXITO = 0.005                 # 0.5% de movimiento requerido para considerar éxito
+EVALUACION_VELAS = 12
+RANGO_EXITO = 0.005
 
 # Variables de estado
 last_impulse_time = None
@@ -132,12 +129,9 @@ alerted_proximidad = {}
 sweep_pendiente = None
 ultima_zona_arriba = None
 ultima_zona_abajo = None
-
-# Historial de incrementos de OI
 oi_increment_history = []
-
-# Historial de eventos para backtesting dinámico (en memoria)
-historial_eventos = deque(maxlen=2000)  # guarda últimos 2000 eventos
+historial_eventos = deque(maxlen=2000)
+ultimos_eventos = deque(maxlen=10)
 
 # =========================
 # FUNCIONES AUXILIARES
@@ -270,29 +264,18 @@ def misma_zona(z1, z2):
     return diff_arriba < ZONA_EQUIVALENTE and diff_abajo < ZONA_EQUIVALENTE
 
 def calcular_bias(df_1h, df_4h, precio_actual):
-    """
-    Calcula el bias direccional basado en EMAs y pendiente.
-    Retorna: "ALCISTA", "BAJISTA" o "LATERAL"
-    """
     if df_1h.empty or df_4h.empty:
         return "LATERAL"
-
-    # EMAs
     ema_short_1h = df_1h["close"].ewm(span=EMA_SHORT, adjust=False).mean().iloc[-1]
     ema_long_1h = df_1h["close"].ewm(span=EMA_LONG, adjust=False).mean().iloc[-1]
     ema_short_4h = df_4h["close"].ewm(span=EMA_SHORT, adjust=False).mean().iloc[-1]
     ema_long_4h = df_4h["close"].ewm(span=EMA_LONG, adjust=False).mean().iloc[-1]
-
-    # Pendiente simple (comparar últimos 2 valores)
     pendiente_1h = df_1h["close"].iloc[-1] - df_1h["close"].iloc[-2]
     pendiente_4h = df_4h["close"].iloc[-1] - df_4h["close"].iloc[-2]
-
-    # Reglas
     alcista = (precio_actual > ema_short_1h and ema_short_1h > ema_long_1h and pendiente_1h > 0) or \
               (precio_actual > ema_short_4h and ema_short_4h > ema_long_4h and pendiente_4h > 0)
     bajista = (precio_actual < ema_short_1h and ema_short_1h < ema_long_1h and pendiente_1h < 0) or \
               (precio_actual < ema_short_4h and ema_short_4h < ema_long_4h and pendiente_4h < 0)
-
     if alcista and not bajista:
         return "ALCISTA"
     elif bajista and not alcista:
@@ -301,20 +284,84 @@ def calcular_bias(df_1h, df_4h, precio_actual):
         return "LATERAL"
 
 def normalizar_score(score, max_teorico=SCORE_MAX_TEORICO):
-    """Convierte un score absoluto a escala 0-10."""
     return round(score / max_teorico * 10, 1)
 
+def calcular_peso_zona(zona_spot, zona_oi, precio_actual):
+    peso = 0
+    if zona_spot:
+        peso += PESOS["zona_spot"]
+        if zona_spot["toques"] >= 5:
+            peso += PESOS["toques_altos"]
+        if distancia(zona_spot, precio_actual) < 0.005:
+            peso += PESOS["cercania"]
+    if zona_oi:
+        peso += peso_por_oi(zona_oi["oi_total"])
+        if distancia(zona_oi, precio_actual) < 0.005:
+            peso += PESOS["cercania"]
+    return peso
+
+def calcular_score_evento(evento_tipo, direccion_evento, bias, peso_zona, validacion_spot=False):
+    score = peso_zona
+    score += PESOS.get(f"evento_{evento_tipo}", 0)
+    if validacion_spot:
+        score += PESOS["validacion_spot"]
+    if bias == "LATERAL":
+        if evento_tipo == "sweep":
+            score += PESOS["bias_favorable_lateral"]
+    elif bias == direccion_evento:
+        score += PESOS["bias_favorable_tendencia"]
+    return score
+
+def registrar_evento_para_patron(tipo, direccion):
+    clave = f"{tipo}_{direccion}"
+    ultimos_eventos.append(clave)
+    if len(ultimos_eventos) >= 3:
+        if all(e == f"sweep_{direccion}" for e in list(ultimos_eventos)[-3:]):
+            enviar(f"⚠️ POSIBLE ACUMULACIÓN: 3 sweeps {direccion} consecutivos")
+
+def generar_setup(evento_tipo, direccion_evento, zona, precio_actual, score_norm):
+    setup = None
+    if evento_tipo == "sweep" and direccion_evento == "ALCISTA" and score_norm >= 7:
+        setup = {
+            "accion": "COMPRA (LONG)",
+            "entrada": round(precio_actual, 1),
+            "stop_loss": round(zona["min"] * 0.995, 1),
+            "take_profit": round(zona["centro"] * 1.01, 1),
+            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
+        }
+    elif evento_tipo == "sweep" and direccion_evento == "BAJISTA" and score_norm >= 7:
+        setup = {
+            "accion": "VENTA (SHORT)",
+            "entrada": round(precio_actual, 1),
+            "stop_loss": round(zona["max"] * 1.005, 1),
+            "take_profit": round(zona["centro"] * 0.99, 1),
+            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
+        }
+    elif evento_tipo == "breakout" and direccion_evento == "ALCISTA" and score_norm >= 7:
+        setup = {
+            "accion": "COMPRA (LONG)",
+            "entrada": round(precio_actual, 1),
+            "stop_loss": round(zona["min"] * 0.995, 1),
+            "take_profit": round(zona["centro"] * 1.02, 1),
+            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
+        }
+    elif evento_tipo == "breakout" and direccion_evento == "BAJISTA" and score_norm >= 7:
+        setup = {
+            "accion": "VENTA (SHORT)",
+            "entrada": round(precio_actual, 1),
+            "stop_loss": round(zona["max"] * 1.005, 1),
+            "take_profit": round(zona["centro"] * 0.98, 1),
+            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
+        }
+    return setup
+
 # =========================
-# FUNCIONES PARA OPEN INTEREST (FUTUROS)
+# FUNCIONES PARA OPEN INTEREST
 # =========================
 
 def obtener_open_interest_hist(period="5m", limit=200):
     url = "https://fapi.binance.com/futures/data/openInterestHist"
-    params = {
-        "symbol": SYMBOL,
-        "period": period,
-        "limit": limit
-    }
+    params = {"symbol": SYMBOL, "period": period, "limit": limit}
     try:
         data = requests.get(url, params=params, timeout=10).json()
         df = pd.DataFrame(data)
@@ -323,7 +370,7 @@ def obtener_open_interest_hist(period="5m", limit=200):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
         return df
     except Exception as e:
-        print(f"Error obteniendo Open Interest: {e}")
+        print(f"Error OI: {e}")
         return pd.DataFrame()
 
 def cluster_oi_por_precio(eventos_oi):
@@ -356,31 +403,25 @@ def cluster_oi_por_precio(eventos_oi):
 
 def detectar_zonas_oi(df_oi, df_spot):
     global oi_increment_history
-
     if df_oi.empty or len(df_oi) < OI_LOOKBACK + 1:
         return []
-
     nuevos_incrementos = []
     for i in range(1, len(df_oi)):
-        oi_actual = float(df_oi.iloc[i]["sumOpenInterestValue"])
-        oi_anterior = float(df_oi.iloc[i-1]["sumOpenInterestValue"])
-        inc = max(0, oi_actual - oi_anterior)
-        nuevos_incrementos.append(inc)
-
+        oi_act = float(df_oi.iloc[i]["sumOpenInterestValue"])
+        oi_ant = float(df_oi.iloc[i-1]["sumOpenInterestValue"])
+        nuevos_incrementos.append(max(0, oi_act - oi_ant))
     oi_increment_history.extend(nuevos_incrementos)
     if len(oi_increment_history) > OI_WINDOW:
         oi_increment_history = oi_increment_history[-OI_WINDOW:]
-
-    umbral_dinamico = np.percentile(oi_increment_history, OI_PERCENTILE) if len(oi_increment_history) >= 10 else (20_000_000)
-
-    eventos_oi = []
+    umbral = np.percentile(oi_increment_history, OI_PERCENTILE) if len(oi_increment_history) >= 10 else 20_000_000
+    eventos = []
     for i in range(OI_LOOKBACK, len(df_oi)):
-        suma_incrementos = 0
+        suma = 0
         for j in range(i - OI_LOOKBACK + 1, i + 1):
-            oi_actual = float(df_oi.iloc[j]["sumOpenInterestValue"])
-            oi_anterior = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
-            suma_incrementos += max(0, oi_actual - oi_anterior)
-        if suma_incrementos > umbral_dinamico:
+            oi_act = float(df_oi.iloc[j]["sumOpenInterestValue"])
+            oi_ant = float(df_oi.iloc[j-1]["sumOpenInterestValue"])
+            suma += max(0, oi_act - oi_ant)
+        if suma > umbral:
             ts = df_oi.iloc[i]["timestamp"]
             precio_zona = None
             if not df_spot.empty and 'time' in df_spot.columns:
@@ -388,17 +429,10 @@ def detectar_zonas_oi(df_oi, df_spot):
                 idx = (df_spot['time_dt'] - ts).abs().idxmin()
                 precio_zona = df_spot.loc[idx, 'close']
             if precio_zona:
-                eventos_oi.append({
-                    "precio": precio_zona,
-                    "oi_incremento": suma_incrementos,
-                    "timestamp": ts
-                })
-
-    if not eventos_oi:
+                eventos.append({"precio": precio_zona, "oi_incremento": suma, "timestamp": ts})
+    if not eventos:
         return []
-
-    clusters = cluster_oi_por_precio(eventos_oi)
-
+    clusters = cluster_oi_por_precio(eventos)
     for c in clusters:
         if c["oi_total"] > OI_CONFIANZA_ALTA:
             c["confianza"] = "🔥🔥🔥"
@@ -406,106 +440,16 @@ def detectar_zonas_oi(df_oi, df_spot):
             c["confianza"] = "🔥🔥"
         else:
             c["confianza"] = "🔥"
-
     return clusters
 
 # =========================
-# FUNCIONES DE SCORE Y PESOS (MEJORADAS)
-# =========================
-
-def calcular_peso_zona(zona_spot, zona_oi, precio_actual):
-    peso = 0
-    if zona_spot:
-        peso += PESOS["zona_spot"]
-        if zona_spot["toques"] >= 5:
-            peso += PESOS["toques_altos"]
-        if distancia(zona_spot, precio_actual) < 0.005:
-            peso += PESOS["cercania"]
-    if zona_oi:
-        peso += peso_por_oi(zona_oi["oi_total"])  # ahora escalado
-        if distancia(zona_oi, precio_actual) < 0.005:
-            peso += PESOS["cercania"]
-    return peso
-
-def calcular_score_evento(evento_tipo, direccion_evento, bias, peso_zona, validacion_spot=False):
-    score = peso_zona
-    score += PESOS.get(f"evento_{evento_tipo}", 0)
-    if validacion_spot:
-        score += PESOS["validacion_spot"]
-
-    # Bias más inteligente
-    if bias == "LATERAL":
-        if evento_tipo == "sweep":
-            score += PESOS["bias_favorable_lateral"]
-    elif bias == direccion_evento:
-        score += PESOS["bias_favorable_tendencia"]
-
-    return score
-
-# =========================
-# DETECCIÓN DE PATRONES
-# =========================
-
-ultimos_eventos = deque(maxlen=10)  # guarda los últimos 10 eventos (tipo + dirección)
-
-def registrar_evento_para_patron(tipo, direccion):
-    clave = f"{tipo}_{direccion}"
-    ultimos_eventos.append(clave)
-    # Detectar 3 sweeps consecutivos en la misma dirección
-    if len(ultimos_eventos) >= 3:
-        if all(e == f"sweep_{direccion}" for e in list(ultimos_eventos)[-3:]):
-            enviar(f"⚠️ POSIBLE ACUMULACIÓN: 3 sweeps {direccion} consecutivos")
-
-# =========================
-# GENERACIÓN DE SETUPS (ACCIÓN SUGERIDA)
-# =========================
-
-def generar_setup(evento_tipo, direccion_evento, zona, precio_actual, score_norm):
-    setup = None
-    if evento_tipo == "sweep" and direccion_evento == "ALCISTA" and score_norm >= 7:
-        # Sweep alcista (reversión arriba) -> setup LONG
-        setup = {
-            "accion": "COMPRA (LONG)",
-            "entrada": round(precio_actual, 1),
-            "stop_loss": round(zona["min"] * 0.995, 1),
-            "take_profit": round(zona["centro"] * 1.01, 1),
-            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
-        }
-    elif evento_tipo == "sweep" and direccion_evento == "BAJISTA" and score_norm >= 7:
-        setup = {
-            "accion": "VENTA (SHORT)",
-            "entrada": round(precio_actual, 1),
-            "stop_loss": round(zona["max"] * 1.005, 1),
-            "take_profit": round(zona["centro"] * 0.99, 1),
-            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
-        }
-    elif evento_tipo == "breakout" and direccion_evento == "ALCISTA" and score_norm >= 7:
-        setup = {
-            "accion": "COMPRA (LONG)",
-            "entrada": round(precio_actual, 1),
-            "stop_loss": round(zona["min"] * 0.995, 1),
-            "take_profit": round(zona["centro"] * 1.02, 1),  # objetivo más amplio
-            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
-        }
-    elif evento_tipo == "breakout" and direccion_evento == "BAJISTA" and score_norm >= 7:
-        setup = {
-            "accion": "VENTA (SHORT)",
-            "entrada": round(precio_actual, 1),
-            "stop_loss": round(zona["max"] * 1.005, 1),
-            "take_profit": round(zona["centro"] * 0.98, 1),
-            "confianza": "ALTA" if score_norm >= 8 else "MEDIA"
-        }
-    return setup
-
-# =========================
-# RADAR 1
+# RADARES
 # =========================
 
 def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora, bias):
     global ultima_zona_arriba, ultima_zona_abajo
 
     def enviar_zona(zona, tipo, es_oi, zonas_spot_referencia=None):
-        # Calcular peso y validación
         peso_zona = calcular_peso_zona(zona if not es_oi else None, zona if es_oi else None, precio)
         validacion = ""
         if es_oi and zonas_spot_referencia:
@@ -513,7 +457,6 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
                 if zs and abs(zona['centro'] - zs['centro']) / zona['centro'] < SPOT_FUTUROS_TOLERANCIA:
                     validacion = "\n✅ Confirmado por spot"
                     break
-
         if es_oi:
             icono = "🧲"
             fuente = "FUTUROS"
@@ -524,10 +467,8 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
             icono = "💰"
             fuente = "SPOT"
             linea_extra = f"{zona['toques']} toques{' 🔥' if zona['toques'] >= 5 else ''}"
-
         direccion_texto = "ARRIBA" if tipo == "HIGH" else "ABAJO"
         color_direccion = "🟢" if tipo == "HIGH" else "🔴"
-
         centro = fmt(zona['centro'])
         rango = f"{fmt(zona['min'])}-{fmt(zona['max'])}"
         dist = distancia(zona, precio) * 100
@@ -537,8 +478,7 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         msg += f"{linea_extra}"
         if validacion:
             msg += validacion
-        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}\n"
-        msg += f"Bias: {bias}"
+        msg += f"\n\nPrecio actual: {fmt(precio)} | Hora: {hora}\nBias: {bias}"
         enviar(msg)
 
     if mejor_zona_oi_arriba:
@@ -559,23 +499,15 @@ def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
     else:
         ultima_zona_abajo = None
 
-# =========================
-# RADAR 2 (PROXIMIDAD)
-# =========================
-
 def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora, bias):
     global last_event_time
-
-    # Solo considerar zonas que coincidan con la última de Radar 1
     if ultima_zona_arriba is not None:
         if mejor_zona_arriba and abs(mejor_zona_arriba["centro"] - ultima_zona_arriba) / ultima_zona_arriba > 0.001:
             mejor_zona_arriba = None
     if ultima_zona_abajo is not None:
         if mejor_zona_abajo and abs(mejor_zona_abajo["centro"] - ultima_zona_abajo) / ultima_zona_abajo > 0.001:
             mejor_zona_abajo = None
-
     ahora = datetime.now(UTC)
-
     def check_and_send(zona, color_emoji, tipo):
         if zona is None:
             return False
@@ -592,21 +524,15 @@ def radar_proximidad(mejor_zona_arriba, mejor_zona_abajo, precio, hora, bias):
                 last_event_time = ahora
                 return True
         return False
-
     if mejor_zona_arriba:
         check_and_send(mejor_zona_arriba, "🟢", "HIGH")
     if mejor_zona_abajo:
         check_and_send(mejor_zona_abajo, "🔴", "LOW")
 
-# =========================
-# RADAR 0 (IMPULSO) CONDICIONADO
-# =========================
-
 def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     global last_impulse_time, last_event_time, historial_eventos
     if df_entry.empty or len(df_entry) < 3:
         return
-
     vela = df_entry.iloc[-1]
     try:
         open_price = float(vela["open"])
@@ -614,31 +540,22 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         volume = float(vela["volume"])
     except:
         return
-
     price_change = abs(close_price - open_price) / open_price * 100
-
     if price_change < IMPULSE_PRICE_CHANGE:
         return
-
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
-
     alcista = close_price > open_price
     direccion = "ALCISTA" if alcista else "BAJISTA"
     emoji = "🟢" if alcista else "🔴"
-
-    # Determinar si el impulso apunta hacia alguna zona relevante
     zona_relevante = None
     if alcista and zonas_arriba:
-        zona_relevante = zonas_arriba[0]  # la más cercana arriba
+        zona_relevante = zonas_arriba[0]
     elif not alcista and zonas_abajo:
-        zona_relevante = zonas_abajo[0]   # la más cercana abajo
-
+        zona_relevante = zonas_abajo[0]
     if not zona_relevante:
         return
-
-    # Calcular peso de la zona
     peso_zona = calcular_peso_zona(zona_relevante if 'toques' in zona_relevante else None,
                                     zona_relevante if 'oi_total' in zona_relevante else None, precio_actual)
     validacion_spot = False
@@ -647,17 +564,11 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
             if 'toques' in z and abs(zona_relevante['centro'] - z['centro']) / zona_relevante['centro'] < SPOT_FUTUROS_TOLERANCIA:
                 validacion_spot = True
                 break
-
     score_abs = calcular_score_evento("impulso", direccion, bias, peso_zona, validacion_spot)
     score_norm = normalizar_score(score_abs)
-
     if score_norm < SCORE_UMBRAL_ACCION:
         return
-
-    # Registrar patrón
     registrar_evento_para_patron("impulso", direccion)
-
-    # Guardar evento en historial (con resultado pendiente)
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "impulso",
@@ -667,15 +578,11 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         "score_norm": score_norm,
         "volumen": volume,
         "zona_centro": zona_relevante['centro'],
-        "resultado": None,  # pendiente
+        "resultado": None,
         "evaluado": False
     }
     historial_eventos.append(evento)
-
-    # Generar setup si aplica
     setup = generar_setup("impulso", direccion, zona_relevante, precio_actual, score_norm)
-
-    # Enviar alerta
     titulo = f"🚀 Radar 0 - Impulso {direccion} {emoji} (score {score_norm}/10)"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
@@ -694,10 +601,6 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     last_impulse_time = ahora
     last_event_time = ahora
 
-# =========================
-# RADAR 3 (SWEEP) CONDICIONADO
-# =========================
-
 def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
     global sweep_pendiente, last_event_time, historial_eventos
     if df_entry.empty or len(df_entry) < 2:
@@ -714,8 +617,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         else:
             sweep_pendiente = None
             return
-
-        # Calcular peso y score
         peso_zona = calcular_peso_zona(zona if 'toques' in zona else None,
                                         zona if 'oi_total' in zona else None, precio_actual)
         validacion_spot = False
@@ -726,18 +627,12 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                     break
         score_abs = calcular_score_evento("sweep", direccion_rev, bias, peso_zona, validacion_spot)
         score_norm = normalizar_score(score_abs)
-
         if score_norm < SCORE_UMBRAL_ACCION:
             sweep_pendiente = None
             return
-
-        # Registrar patrón
         registrar_evento_para_patron("sweep", direccion_rev)
-
         ahora = datetime.now(UTC)
         color_zona = "🟢" if tipo_sweep == "HIGH" else "🔴"
-
-        # Guardar evento
         evento = {
             "timestamp": ahora.isoformat(),
             "tipo": "sweep",
@@ -750,10 +645,7 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             "evaluado": False
         }
         historial_eventos.append(evento)
-
-        # Generar setup
         setup = generar_setup("sweep", direccion_rev, zona, precio_actual, score_norm)
-
         titulo = f"🔄 Radar 3 – SWEEP {tipo_sweep} {color_zona} ({fmt(zona['centro'])}) (score {score_norm}/10)"
         msg = f"{titulo}\n\n"
         msg += f"REVERSIÓN {direccion_rev} {emoji_rev}\n\n"
@@ -770,13 +662,10 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         last_event_time = ahora
         sweep_pendiente = None
         return
-
     if len(df_entry) < 2:
         return
     vela_anterior = df_entry.iloc[-2]
     vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
-
-    # Buscar sweep solo en zonas con peso suficiente
     zonas_a_evaluar = []
     if mejor_zona_arriba:
         peso = calcular_peso_zona(mejor_zona_arriba if 'toques' in mejor_zona_arriba else None,
@@ -788,7 +677,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                                    mejor_zona_abajo if 'oi_total' in mejor_zona_abajo else None, precio_actual)
         if peso >= 3:
             zonas_a_evaluar.append(mejor_zona_abajo)
-
     for zona in zonas_a_evaluar:
         if 'max' in zona and vela_anterior["high"] > zona["max"] * (1 + SWEEP_BREAK_MARGIN) and vela_anterior["close"] < zona["centro"]:
             if vela_anterior["volume"] > vol_medio * SWEEP_VOLUME_FACTOR:
@@ -799,10 +687,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                 sweep_pendiente = (zona, "LOW")
                 break
 
-# =========================
-# RADAR 4 (BREAKOUT) CON RETEST
-# =========================
-
 def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
     global zona_consumida, last_event_time, alerted_liquidity, historial_eventos
     if df_entry.empty or len(df_entry) < BREAKOUT_RETEST_CANDLES + 1:
@@ -810,18 +694,16 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
     vela = df_entry.iloc[-1]
     close = vela["close"]
     ahora = datetime.now(UTC)
-
     def hubo_retest(zona, direccion):
         if BREAKOUT_RETEST_CANDLES == 0:
             return True
         for i in range(2, BREAKOUT_RETEST_CANDLES + 2):
             if i > len(df_entry):
                 break
-            vela_anterior = df_entry.iloc[-i]
-            if vela_anterior["close"] > zona["min"] and vela_anterior["close"] < zona["max"]:
+            vela_ant = df_entry.iloc[-i]
+            if vela_ant["close"] > zona["min"] and vela_ant["close"] < zona["max"]:
                 return True
         return False
-
     if mejor_zona_arriba:
         key = ("break", redondear_centro(mejor_zona_arriba["centro"]))
         if key not in alerted_liquidity and close > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) * (1 + BREAKOUT_MARGIN):
@@ -836,11 +718,9 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                             break
                 score_abs = calcular_score_evento("breakout", "ALCISTA", bias, peso_zona, validacion_spot)
                 score_norm = normalizar_score(score_abs)
-
                 if score_norm >= SCORE_UMBRAL_ACCION:
                     alerted_liquidity.add(key)
                     zona_consumida = True
-                    # Registrar evento
                     evento = {
                         "timestamp": ahora.isoformat(),
                         "tipo": "breakout",
@@ -854,10 +734,7 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                     }
                     historial_eventos.append(evento)
                     registrar_evento_para_patron("breakout", "ALCISTA")
-
-                    # Setup
                     setup = generar_setup("breakout", "ALCISTA", mejor_zona_arriba, close, score_norm)
-
                     titulo = f"🌋 Radar 4 – BREAKOUT ALCISTA 🟢 ({fmt(mejor_zona_arriba['centro'])}) (score {score_norm}/10)"
                     msg = f"{titulo}\n\n"
                     msg += f"Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
@@ -872,7 +749,6 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                     enviar(msg)
                     last_event_time = ahora
                     return
-
     if mejor_zona_abajo:
         key = ("break", redondear_centro(mejor_zona_abajo["centro"]))
         if key not in alerted_liquidity and close < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) * (1 - BREAKOUT_MARGIN):
@@ -887,7 +763,6 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                             break
                 score_abs = calcular_score_evento("breakout", "BAJISTA", bias, peso_zona, validacion_spot)
                 score_norm = normalizar_score(score_abs)
-
                 if score_norm >= SCORE_UMBRAL_ACCION:
                     alerted_liquidity.add(key)
                     zona_consumida = True
@@ -904,9 +779,7 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                     }
                     historial_eventos.append(evento)
                     registrar_evento_para_patron("breakout", "BAJISTA")
-
                     setup = generar_setup("breakout", "BAJISTA", mejor_zona_abajo, close, score_norm)
-
                     titulo = f"🌋 Radar 4 – BREAKOUT BAJISTA 🔴 ({fmt(mejor_zona_abajo['centro'])}) (score {score_norm}/10)"
                     msg = f"{titulo}\n\n"
                     msg += f"Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
@@ -951,32 +824,24 @@ def sin_eventos():
         last_event_time = ahora
 
 # =========================
-# EVALUACIÓN DE RESULTADOS (MACHINE LEARNING MANUAL)
+# EVALUACIÓN DE RESULTADOS Y COMANDOS
 # =========================
 
-def evaluar_eventos_pendientes(df_entry):
-    """Recorre los eventos no evaluados y comprueba si el precio se movió a favor."""
-    global historial_eventos
-    ahora = datetime.now(UTC)
+def evaluar_eventos_pendientes(precio_actual):
     for evento in list(historial_eventos):
         if evento["evaluado"]:
             continue
-        # Buscar la vela correspondiente al timestamp del evento + EVALUACION_VELAS
-        # Simplificación: tomamos el precio actual y vemos si ya pasaron suficientes velas
-        # En un sistema real, habría que buscar en el histórico.
-        # Por ahora, asumimos que si ha pasado el tiempo suficiente, evaluamos con el precio actual.
         ts_evento = datetime.fromisoformat(evento["timestamp"])
-        if (ahora - ts_evento) > timedelta(minutes=EVALUACION_VELAS * 5):  # cada vela 5m
+        if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS * 5):
             precio_inicial = evento["precio"]
-            direccion = evento["direccion"]
-            if direccion == "ALCISTA":
+            if evento["direccion"] == "ALCISTA":
                 if precio_actual >= precio_inicial * (1 + RANGO_EXITO):
                     evento["resultado"] = "EXITO"
                 elif precio_actual <= precio_inicial * (1 - RANGO_EXITO):
                     evento["resultado"] = "FRACASO"
                 else:
                     evento["resultado"] = "NEUTRO"
-            else:  # BAJISTA
+            else:
                 if precio_actual <= precio_inicial * (1 - RANGO_EXITO):
                     evento["resultado"] = "EXITO"
                 elif precio_actual >= precio_inicial * (1 + RANGO_EXITO):
@@ -985,14 +850,13 @@ def evaluar_eventos_pendientes(df_entry):
                     evento["resultado"] = "NEUTRO"
             evento["evaluado"] = True
 
-def generar_informe_resultados():
-    """Genera un informe con tasas de éxito por tipo y rango de score."""
+def generar_informe_resultados_como_texto():
     if not historial_eventos:
-        return
+        return None
     df = pd.DataFrame(list(historial_eventos))
     df = df[df["evaluado"] == True]
     if df.empty:
-        return
+        return None
     informe = "📊 **INFORME DE RESULTADOS**\n\n"
     for tipo in df["tipo"].unique():
         subset = df[df["tipo"] == tipo]
@@ -1000,19 +864,51 @@ def generar_informe_resultados():
         exitos = len(subset[subset["resultado"] == "EXITO"])
         fracasos = len(subset[subset["resultado"] == "FRACASO"])
         neutros = len(subset[subset["resultado"] == "NEUTRO"])
-        tasa_exito = exitos / total * 100 if total > 0 else 0
-        informe += f"🔹 {tipo.upper()}: {total} eventos | Éxito: {exitos} ({tasa_exito:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
-        # Por rangos de score
+        tasa = exitos / total * 100 if total else 0
+        informe += f"🔹 {tipo.upper()}: {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
         for rango in [(0,5),(5,7),(7,10)]:
             sub = subset[(subset["score_norm"] >= rango[0]) & (subset["score_norm"] < rango[1])]
             if not sub.empty:
                 ex = len(sub[sub["resultado"] == "EXITO"])
                 to = len(sub)
                 informe += f"   Score {rango[0]}-{rango[1]}: {to} ops, éxito {ex/to*100:.1f}%\n"
-    enviar(informe)
+    return informe
 
 # =========================
-# FUNCIÓN PRINCIPAL
+# COMANDOS DE TELEGRAM
+# =========================
+
+ultimo_update_id = None
+
+def obtener_mensajes():
+    global ultimo_update_id
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    params = {"timeout": 30, "offset": ultimo_update_id}
+    try:
+        r = requests.get(url, params=params, timeout=35)
+        data = r.json()
+        if data["ok"]:
+            for update in data["result"]:
+                ultimo_update_id = update["update_id"] + 1
+                if "message" in update and "text" in update["message"]:
+                    texto = update["message"]["text"]
+                    chat_id = update["message"]["chat"]["id"]
+                    if texto.startswith("/"):
+                        procesar_comando(texto, chat_id)
+    except Exception as e:
+        print(f"Error getUpdates: {e}")
+
+def procesar_comando(texto, chat_id):
+    if texto == "/stats" or texto == "/reporte":
+        informe = generar_informe_resultados_como_texto()
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        if informe:
+            requests.post(url, data={"chat_id": chat_id, "text": informe}, timeout=10)
+        else:
+            requests.post(url, data={"chat_id": chat_id, "text": "No hay datos suficientes aún."}, timeout=10)
+
+# =========================
+# FUNCIÓN PRINCIPAL EVALUAR
 # =========================
 
 def evaluar():
@@ -1021,7 +917,6 @@ def evaluar():
     ahora = datetime.now(UTC)
     hora_str = ahora.strftime('%H:%M')
 
-    # Obtener datos
     df_1h = obtener_candles_spot(INTERVAL_MACRO)
     df_4h = obtener_candles_spot(INTERVAL_BIAS)
     df_entry = obtener_candles_spot(INTERVAL_ENTRY)
@@ -1031,21 +926,13 @@ def evaluar():
     if df_entry.empty or precio is None:
         return
 
-    # Evaluar eventos pendientes
     evaluar_eventos_pendientes(precio)
 
-    # Cada cierto tiempo, generar informe (ej. cada 6h)
-    if ahora.minute == 0 and ahora.hour % 6 == 0:  # cada 6h en punto
-        generar_informe_resultados()
-
-    # Calcular bias
     bias = calcular_bias(df_1h, df_4h, precio)
 
-    # Detectar zonas spot
     zonas_high_spot, zonas_low_spot = detectar_zonas_spot(df_1h) if not df_1h.empty else ([], [])
     mejor_spot_arriba, mejor_spot_abajo = seleccionar_mejores_zonas_spot(zonas_high_spot, zonas_low_spot, precio)
 
-    # Detectar zonas OI
     clusters_oi = detectar_zonas_oi(df_oi, df_1h) if not df_oi.empty else []
     mejor_oi_arriba = None
     mejor_oi_abajo = None
@@ -1059,12 +946,10 @@ def evaluar():
             abajo_oi.sort(key=lambda x: x["oi_total"], reverse=True)
             mejor_oi_abajo = abajo_oi[0]
 
-    # Definir zona actual
     centro_arriba = mejor_oi_arriba["centro"] if mejor_oi_arriba else (mejor_spot_arriba["centro"] if mejor_spot_arriba else None)
     centro_abajo = mejor_oi_abajo["centro"] if mejor_oi_abajo else (mejor_spot_abajo["centro"] if mejor_spot_abajo else None)
     nueva_zona = (centro_arriba, centro_abajo)
 
-    # Radar 1 si cambia zona
     if not misma_zona(zona_actual, nueva_zona):
         zona_actual = nueva_zona
         zona_consumida = False
@@ -1074,7 +959,6 @@ def evaluar():
             last_mapa_time = ahora
         last_event_time = ahora
 
-    # Limpieza de proximidad
     keys_a_remover = []
     for key, ts in alerted_proximidad.items():
         if (ahora - ts) > timedelta(hours=2):
@@ -1082,36 +966,26 @@ def evaluar():
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
 
-    # Zonas de referencia para radares (prioridad OI)
     zona_ref_arriba = mejor_oi_arriba if mejor_oi_arriba else mejor_spot_arriba
     zona_ref_abajo = mejor_oi_abajo if mejor_oi_abajo else mejor_spot_abajo
 
-    # Listas completas para búsquedas
     zonas_arriba = [z for z in ([mejor_oi_arriba] if mejor_oi_arriba else []) + ([mejor_spot_arriba] if mejor_spot_arriba else []) if z]
     zonas_abajo = [z for z in ([mejor_oi_abajo] if mejor_oi_abajo else []) + ([mejor_spot_abajo] if mejor_spot_abajo else []) if z]
 
-    # Radar 2
     radar_proximidad(zona_ref_arriba, zona_ref_abajo, precio, hora_str, bias)
-
-    # Radar 0
     radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias)
-
-    # Radar 3
     radar_sweep(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
-
-    # Radar 4
     radar_breakout(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
 
-    # Sistema
     heartbeat()
     sin_eventos()
 
 # =========================
-# INICIO
+# BUCLE PRINCIPAL
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V12.1 (con ML manual, score normalizado, setups)...")
+    print("🚀 Iniciando BOT V12.1 con comandos...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V12.1)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
@@ -1121,14 +995,19 @@ if __name__ == "__main__":
     last_event_time = datetime.now(UTC)
     last_mapa_time = None
 
-    # Cargar historial si existe
     if os.path.exists(HISTORIAL_FILE):
         try:
             with open(HISTORIAL_FILE, "r") as f:
                 data = json.load(f)
-                historial_eventos.extend(data[-2000:])  # últimos 2000
+                historial_eventos.extend(data[-2000:])
         except:
             pass
+
+    def escuchar_mensajes():
+        while True:
+            obtener_mensajes()
+            time.sleep(1)
+    threading.Thread(target=escuchar_mensajes, daemon=True).start()
 
     while True:
         try:
@@ -1139,7 +1018,6 @@ if __name__ == "__main__":
             time.sleep(60)
         time.sleep(60)
 
-        # Guardar historial periódicamente (cada hora)
         if datetime.now(UTC).minute == 0:
             try:
                 with open(HISTORIAL_FILE, "w") as f:

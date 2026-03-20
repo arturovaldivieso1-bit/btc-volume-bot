@@ -533,6 +533,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     global last_impulse_time, last_event_time, historial_eventos
     if df_entry.empty or len(df_entry) < 3:
         return
+
     vela = df_entry.iloc[-1]
     try:
         open_price = float(vela["open"])
@@ -540,35 +541,42 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         volume = float(vela["volume"])
     except:
         return
+
     price_change = abs(close_price - open_price) / open_price * 100
     if price_change < IMPULSE_PRICE_CHANGE:
         return
+
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
         return
+
     alcista = close_price > open_price
     direccion = "ALCISTA" if alcista else "BAJISTA"
     emoji = "🟢" if alcista else "🔴"
+
+    # Detectar zona en la dirección del impulso (para contexto, no para filtrar)
     zona_relevante = None
     if alcista and zonas_arriba:
         zona_relevante = zonas_arriba[0]
     elif not alcista and zonas_abajo:
         zona_relevante = zonas_abajo[0]
-    if not zona_relevante:
-        return
-    peso_zona = calcular_peso_zona(zona_relevante if 'toques' in zona_relevante else None,
-                                    zona_relevante if 'oi_total' in zona_relevante else None, precio_actual)
+
+    # Calcular score y otras métricas (solo para registro, no para filtro)
+    peso_zona = 0
     validacion_spot = False
-    if 'oi_total' in zona_relevante:
-        for z in (zonas_arriba + zonas_abajo):
-            if 'toques' in z and abs(zona_relevante['centro'] - z['centro']) / zona_relevante['centro'] < SPOT_FUTUROS_TOLERANCIA:
-                validacion_spot = True
-                break
+    if zona_relevante:
+        peso_zona = calcular_peso_zona(zona_relevante if 'toques' in zona_relevante else None,
+                                        zona_relevante if 'oi_total' in zona_relevante else None, precio_actual)
+        if 'oi_total' in zona_relevante:
+            for z in (zonas_arriba + zonas_abajo):
+                if 'toques' in z and abs(zona_relevante['centro'] - z['centro']) / zona_relevante['centro'] < SPOT_FUTUROS_TOLERANCIA:
+                    validacion_spot = True
+                    break
+
     score_abs = calcular_score_evento("impulso", direccion, bias, peso_zona, validacion_spot)
     score_norm = normalizar_score(score_abs)
-    if score_norm < SCORE_UMBRAL_ACCION:
-        return
-    registrar_evento_para_patron("impulso", direccion)
+
+    # Registrar evento en historial
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "impulso",
@@ -577,19 +585,26 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         "score_abs": score_abs,
         "score_norm": score_norm,
         "volumen": volume,
-        "zona_centro": zona_relevante['centro'],
+        "zona_centro": zona_relevante['centro'] if zona_relevante else None,
         "resultado": None,
         "evaluado": False
     }
     historial_eventos.append(evento)
-    setup = generar_setup("impulso", direccion, zona_relevante, precio_actual, score_norm)
+
+    # Generar setup solo si el score es alto
+    setup = None
+    if zona_relevante and score_norm >= 7:
+        setup = generar_setup("impulso", direccion, zona_relevante, precio_actual, score_norm)
+
+    # Construir mensaje
     titulo = f"🚀 Radar 0 - Impulso {direccion} {emoji} (score {score_norm}/10)"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
     msg += f"Variación: {price_change:.2f}%\n"
     msg += f"Volumen: {volume:.2f} BTC\n"
-    msg += f"Bias: {bias}\n"
-    msg += f"Zona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
+    msg += f"Bias: {bias}"
+    if zona_relevante:
+        msg += f"\nZona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
     if setup:
         msg += f"\n\n👉 SETUP SUGERIDO:\n"
         msg += f"Acción: {setup['accion']}\n"

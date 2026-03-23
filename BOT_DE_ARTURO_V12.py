@@ -83,7 +83,7 @@ def peso_por_oi(oi_total):
     else:
         return 1
 
-# Umbrales de volumen (probabilidades)
+# Umbrales de volumen para probabilidades (estudio)
 VOL1_MED = 400
 VOL1_P75 = 692
 VOL1_P90 = 1134
@@ -114,8 +114,10 @@ REDONDEO_BASE = 200
 
 # ML Manual
 HISTORIAL_FILE = "historial_eventos.json"
-EVALUACION_VELAS = 12
-RANGO_EXITO = 0.005
+EVALUACION_VELAS_SCALP = 3        # 3 velas = 15 minutos
+EVALUACION_VELAS_TEND = 12        # 12 velas = 1 hora
+RANGO_EXITO_SCALP = 0.004         # 0.4% para scalping
+RANGO_EXITO_TEND = 0.005          # 0.5% para tendencia
 
 # Variables de estado
 last_impulse_time = None
@@ -443,7 +445,7 @@ def detectar_zonas_oi(df_oi, df_spot):
     return clusters
 
 # =========================
-# RADARES
+# RADARES (sin cambios en la lógica)
 # =========================
 
 def enviar_liquidez_detectada(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora, bias):
@@ -539,6 +541,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         open_price = float(vela["open"])
         close_price = float(vela["close"])
         volume = float(vela["volume"])
+        vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
     except:
         return
 
@@ -585,8 +588,12 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         "score_abs": score_abs,
         "score_norm": score_norm,
         "volumen": volume,
+        "volumen_ratio": volume / vol_medio if vol_medio else 1.0,
         "zona_centro": zona_relevante['centro'] if zona_relevante else None,
-        "resultado": None,
+        "resultado_scalp": None,
+        "resultado_tendencia": None,
+        "evaluado_scalp": False,
+        "evaluado_tendencia": False,
         "evaluado": False
     }
     historial_eventos.append(evento)
@@ -601,7 +608,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
     msg += f"Variación: {price_change:.2f}%\n"
-    msg += f"Volumen: {volume:.2f} BTC\n"
+    msg += f"Volumen: {volume:.2f} BTC (ratio {volume/vol_medio:.1f}x)\n"
     msg += f"Bias: {bias}"
     if zona_relevante:
         msg += f"\nZona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
@@ -656,7 +663,10 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             "score_abs": score_abs,
             "score_norm": score_norm,
             "zona_centro": zona['centro'],
-            "resultado": None,
+            "resultado_scalp": None,
+            "resultado_tendencia": None,
+            "evaluado_scalp": False,
+            "evaluado_tendencia": False,
             "evaluado": False
         }
         historial_eventos.append(evento)
@@ -744,7 +754,10 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                         "score_abs": score_abs,
                         "score_norm": score_norm,
                         "zona_centro": mejor_zona_arriba['centro'],
-                        "resultado": None,
+                        "resultado_scalp": None,
+                        "resultado_tendencia": None,
+                        "evaluado_scalp": False,
+                        "evaluado_tendencia": False,
                         "evaluado": False
                     }
                     historial_eventos.append(evento)
@@ -789,7 +802,10 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                         "score_abs": score_abs,
                         "score_norm": score_norm,
                         "zona_centro": mejor_zona_abajo['centro'],
-                        "resultado": None,
+                        "resultado_scalp": None,
+                        "resultado_tendencia": None,
+                        "evaluado_scalp": False,
+                        "evaluado_tendencia": False,
                         "evaluado": False
                     }
                     historial_eventos.append(evento)
@@ -822,7 +838,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V12.1)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V12.2)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -839,54 +855,115 @@ def sin_eventos():
         last_event_time = ahora
 
 # =========================
-# EVALUACIÓN DE RESULTADOS Y COMANDOS
+# EVALUACIÓN DE RESULTADOS (MEJORADA CON VOLUMEN Y DUAL)
 # =========================
 
 def evaluar_eventos_pendientes(precio_actual):
     for evento in list(historial_eventos):
-        if evento["evaluado"]:
-            continue
-        ts_evento = datetime.fromisoformat(evento["timestamp"])
-        if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS * 5):
-            precio_inicial = evento["precio"]
-            if evento["direccion"] == "ALCISTA":
-                if precio_actual >= precio_inicial * (1 + RANGO_EXITO):
-                    evento["resultado"] = "EXITO"
-                elif precio_actual <= precio_inicial * (1 - RANGO_EXITO):
-                    evento["resultado"] = "FRACASO"
+        # Evaluación scalping (3 velas)
+        if not evento.get("evaluado_scalp", False):
+            ts_evento = datetime.fromisoformat(evento["timestamp"])
+            if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS_SCALP * 5):
+                precio_inicial = evento["precio"]
+                direccion = evento["direccion"]
+                if direccion == "ALCISTA":
+                    if precio_actual >= precio_inicial * (1 + RANGO_EXITO_SCALP):
+                        evento["resultado_scalp"] = "EXITO"
+                    elif precio_actual <= precio_inicial * (1 - RANGO_EXITO_SCALP):
+                        evento["resultado_scalp"] = "FRACASO"
+                    else:
+                        evento["resultado_scalp"] = "NEUTRO"
                 else:
-                    evento["resultado"] = "NEUTRO"
-            else:
-                if precio_actual <= precio_inicial * (1 - RANGO_EXITO):
-                    evento["resultado"] = "EXITO"
-                elif precio_actual >= precio_inicial * (1 + RANGO_EXITO):
-                    evento["resultado"] = "FRACASO"
+                    if precio_actual <= precio_inicial * (1 - RANGO_EXITO_SCALP):
+                        evento["resultado_scalp"] = "EXITO"
+                    elif precio_actual >= precio_inicial * (1 + RANGO_EXITO_SCALP):
+                        evento["resultado_scalp"] = "FRACASO"
+                    else:
+                        evento["resultado_scalp"] = "NEUTRO"
+                evento["evaluado_scalp"] = True
+
+        # Evaluación tendencia (12 velas)
+        if not evento.get("evaluado_tendencia", False):
+            ts_evento = datetime.fromisoformat(evento["timestamp"])
+            if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS_TEND * 5):
+                precio_inicial = evento["precio"]
+                direccion = evento["direccion"]
+                if direccion == "ALCISTA":
+                    if precio_actual >= precio_inicial * (1 + RANGO_EXITO_TEND):
+                        evento["resultado_tendencia"] = "EXITO"
+                    elif precio_actual <= precio_inicial * (1 - RANGO_EXITO_TEND):
+                        evento["resultado_tendencia"] = "FRACASO"
+                    else:
+                        evento["resultado_tendencia"] = "NEUTRO"
                 else:
-                    evento["resultado"] = "NEUTRO"
+                    if precio_actual <= precio_inicial * (1 - RANGO_EXITO_TEND):
+                        evento["resultado_tendencia"] = "EXITO"
+                    elif precio_actual >= precio_inicial * (1 + RANGO_EXITO_TEND):
+                        evento["resultado_tendencia"] = "FRACASO"
+                    else:
+                        evento["resultado_tendencia"] = "NEUTRO"
+                evento["evaluado_tendencia"] = True
+
+        if evento.get("evaluado_scalp", False) and evento.get("evaluado_tendencia", False):
             evento["evaluado"] = True
 
 def generar_informe_resultados_como_texto():
     if not historial_eventos:
         return None
     df = pd.DataFrame(list(historial_eventos))
-    df = df[df["evaluado"] == True]
-    if df.empty:
+
+    # Filtrar eventos con al menos un resultado
+    df_scalp = df[df["evaluado_scalp"] == True]
+    df_tend = df[df["evaluado_tendencia"] == True]
+
+    if df_scalp.empty and df_tend.empty:
         return None
+
     informe = "📊 **INFORME DE RESULTADOS**\n\n"
+
     for tipo in df["tipo"].unique():
-        subset = df[df["tipo"] == tipo]
-        total = len(subset)
-        exitos = len(subset[subset["resultado"] == "EXITO"])
-        fracasos = len(subset[subset["resultado"] == "FRACASO"])
-        neutros = len(subset[subset["resultado"] == "NEUTRO"])
-        tasa = exitos / total * 100 if total else 0
-        informe += f"🔹 {tipo.upper()}: {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
-        for rango in [(0,5),(5,7),(7,10)]:
-            sub = subset[(subset["score_norm"] >= rango[0]) & (subset["score_norm"] < rango[1])]
-            if not sub.empty:
-                ex = len(sub[sub["resultado"] == "EXITO"])
-                to = len(sub)
-                informe += f"   Score {rango[0]}-{rango[1]}: {to} ops, éxito {ex/to*100:.1f}%\n"
+        informe += f"🔹 {tipo.upper()}\n"
+
+        # Scalping (3 velas)
+        subset = df_scalp[df_scalp["tipo"] == tipo]
+        if not subset.empty:
+            total = len(subset)
+            exitos = len(subset[subset["resultado_scalp"] == "EXITO"])
+            fracasos = len(subset[subset["resultado_scalp"] == "FRACASO"])
+            neutros = len(subset[subset["resultado_scalp"] == "NEUTRO"])
+            tasa = exitos / total * 100 if total else 0
+            informe += f"   ⏱️ Scalping (3v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+
+            # Desglose por volumen (usando el volumen de la vela de impulso)
+            # Definimos rangos: bajo (<300), medio (300-600), alto (>600)
+            vol_bajo = subset[subset["volumen"] < 300]
+            vol_medio = subset[(subset["volumen"] >= 300) & (subset["volumen"] <= 600)]
+            vol_alto = subset[subset["volumen"] > 600]
+            if not vol_bajo.empty:
+                ex = len(vol_bajo[vol_bajo["resultado_scalp"] == "EXITO"])
+                to = len(vol_bajo)
+                informe += f"      📊 Vol <300: {to} ops, éxito {ex/to*100:.1f}%\n"
+            if not vol_medio.empty:
+                ex = len(vol_medio[vol_medio["resultado_scalp"] == "EXITO"])
+                to = len(vol_medio)
+                informe += f"      📊 Vol 300-600: {to} ops, éxito {ex/to*100:.1f}%\n"
+            if not vol_alto.empty:
+                ex = len(vol_alto[vol_alto["resultado_scalp"] == "EXITO"])
+                to = len(vol_alto)
+                informe += f"      📊 Vol >600: {to} ops, éxito {ex/to*100:.1f}%\n"
+
+        # Tendencia (12 velas)
+        subset = df_tend[df_tend["tipo"] == tipo]
+        if not subset.empty:
+            total = len(subset)
+            exitos = len(subset[subset["resultado_tendencia"] == "EXITO"])
+            fracasos = len(subset[subset["resultado_tendencia"] == "FRACASO"])
+            neutros = len(subset[subset["resultado_tendencia"] == "NEUTRO"])
+            tasa = exitos / total * 100 if total else 0
+            informe += f"   📈 Tendencia (12v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+
+        informe += "\n"
+
     return informe
 
 # =========================
@@ -1000,10 +1077,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V12.1 con comandos...")
+    print("🚀 Iniciando BOT V12.2 (con evaluación dual y volumen)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V12.1)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V12.2)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)

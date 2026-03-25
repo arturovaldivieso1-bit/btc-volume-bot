@@ -19,9 +19,9 @@ CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTCUSDT"
 
 # Timeframes
-INTERVAL_MACRO = "1h"          # estructura y régimen
-INTERVAL_ENTRY = "5m"           # eventos
-INTERVAL_BIAS = "4h"            # tendencia macro
+INTERVAL_MACRO = "1h"
+INTERVAL_ENTRY = "5m"
+INTERVAL_BIAS = "4h"
 
 # Parámetros de liquidez spot
 LOOKBACK = 168
@@ -42,18 +42,14 @@ OI_CONFIANZA_BAJA = 100_000_000
 
 SPOT_FUTUROS_TOLERANCIA = 0.005
 
-# Radar 0 – condiciones combinadas (sin ruptura de microestructura)
+# Radar 0 – solo variación de precio ≥0.65%
 IMPULSE_PRICE_CHANGE = 0.65
-IMPULSE_RANGE_FACTOR = 1.5
-IMPULSE_VOLUME_FACTOR = 1.3
-IMPULSE_LOOKBACK = 12
 IMPULSE_COOLDOWN = 300
 
-# Radar 3 y 4 – basados en volumen (mismo estudio que impulso)
-SWEEP_VOLUME_FACTOR = 1.2          # factor para volumen relativo
-SWEEP_BREAK_MARGIN = 0.0005        # 0.05%
-SWEEP_PESO_MINIMO = 2              # peso mínimo de zona para considerar
-
+# Radar 3 y 4
+SWEEP_VOLUME_FACTOR = 1.2
+SWEEP_BREAK_MARGIN = 0.0005
+SWEEP_PESO_MINIMO = 2
 BREAKOUT_MARGIN = 0.003
 BREAKOUT_RETEST_CANDLES = 1
 BREAKOUT_PESO_MINIMO = 2
@@ -324,7 +320,7 @@ def calcular_score_evento(evento_tipo, direccion_evento, bias, peso_zona, valida
             score += PESOS["bias_favorable_lateral"]
     elif bias == direccion_evento:
         score += PESOS["bias_favorable_tendencia"]
-    if volumen and volumen > VOL1_MED:   # umbral base de mediana (400 BTC)
+    if volumen and volumen > VOL1_MED:
         score += PESOS["volumen_alto"]
     return score
 
@@ -394,7 +390,7 @@ def actualizar_regimen(df_estructura, hubo_impulso, resultado_impulso=None):
                 estructura_detected_at = ahora
 
 # =========================
-# FUNCIONES OPEN INTEREST
+# OPEN INTEREST
 # =========================
 
 def obtener_open_interest_hist(period="5m", limit=200):
@@ -519,7 +515,7 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
         check_and_record(mejor_zona_abajo, "LOW")
 
 # =========================
-# RADAR 0 – SIEMPRE INFORMA, CON PROBABILIDADES DE VOLUMEN
+# RADAR 0 – ACTIVACIÓN POR VARIACIÓN DE PRECIO ≥0.65%
 # =========================
 
 def generar_setup_impulso(zona, precio_actual, direccion, score_norm, riesgo_sugerido):
@@ -546,7 +542,7 @@ def generar_setup_impulso(zona, precio_actual, direccion, score_norm, riesgo_sug
 
 def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     global last_impulse_time, last_event_time, historial_eventos, regimen_actual
-    if df_entry.empty or len(df_entry) < max(20, IMPULSE_LOOKBACK + 1):
+    if df_entry.empty or len(df_entry) < 3:
         return False
 
     vela = df_entry.iloc[-1]
@@ -559,12 +555,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         return False
 
     price_change = abs(close_price - open_price) / open_price * 100
-    rango = (vela["high"] - vela["low"]) / vela["close"] * 100
-    rango_medio = ((df_entry["high"] - df_entry["low"]) / df_entry["close"]).rolling(20).mean().iloc[-1] * 100
-
-    # Condición de activación: variación >=0.65%  O  (rango>=1.5x y volumen>=1.3x)
-    condicion = (price_change >= IMPULSE_PRICE_CHANGE) or (rango >= IMPULSE_RANGE_FACTOR * rango_medio and volume >= IMPULSE_VOLUME_FACTOR * vol_medio)
-    if not condicion:
+    if price_change < IMPULSE_PRICE_CHANGE:
         return False
 
     ahora = datetime.now(UTC)
@@ -575,16 +566,16 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     direccion = "ALCISTA" if alcista else "BAJISTA"
     emoji = "🟢" if alcista else "🔴"
 
-    # Zona relevante (solo para contexto)
+    # Zona relevante (solo para contexto y posible setup)
     zona_relevante = None
     if alcista and zonas_arriba:
         zona_relevante = zonas_arriba[0]
     elif not alcista and zonas_abajo:
         zona_relevante = zonas_abajo[0]
 
-    # Calcular score y probabilidades de continuación
-    vol1 = volume
+    # Calcular probabilidades de continuación (1,2,3 velas con misma dirección)
     prob_lines = []
+    vol1 = volume
     prob1 = obtener_probabilidad(vol1, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
     if prob1:
         prob_lines.append(f"  1 vela ({vol1:.0f} BTC): {prob1}%")
@@ -610,7 +601,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     if not prob_lines:
         prob_lines.append(f"  Volumen insuficiente: probabilidad base 68%")
 
-    # Registrar evento
+    # Registrar evento (para estadísticas)
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "impulso",
@@ -649,7 +640,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
             riesgo = 1.0 if regimen_actual == "IMPULSO" else 0.5
             setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm, riesgo)
 
-    # Construir mensaje
+    # Mensaje
     titulo = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
@@ -716,19 +707,14 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             sweep_pendiente = None
             return
 
-        # Calcular volumen de la vela que hizo el sweep (la anterior)
         vela_sweep = df_entry.iloc[-2]
         vol_sweep = vela_sweep["volume"]
 
-        # Probabilidades de continuación usando el estudio (igual que impulso)
+        # Probabilidades de continuación (1 vela del sweep)
         prob_lines = []
-        vol1 = vol_sweep
-        prob1 = obtener_probabilidad(vol1, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
+        prob1 = obtener_probabilidad(vol_sweep, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
         if prob1:
-            prob_lines.append(f"  1 vela ({vol1:.0f} BTC): {prob1}%")
-
-        # (Opcional) acumulado con velas anteriores de misma dirección, pero simplificamos
-        # Por ahora solo mostramos el volumen de la vela que barrió
+            prob_lines.append(f"  Volumen barrido: {vol_sweep:.0f} BTC -> {prob1}%")
 
         # Calcular score y setup
         peso_zona = calcular_peso_zona(zona if 'toques' in zona else None,
@@ -1199,7 +1185,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V13.2 (impulsos siempre informan, volumen study)...")
+    print("🚀 Iniciando BOT V13.2 (variación ≥0.65% siempre alerta)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.2)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"

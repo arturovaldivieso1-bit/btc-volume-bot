@@ -19,9 +19,9 @@ CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTCUSDT"
 
 # Timeframes
-INTERVAL_MACRO = "1h"          # Para estructura de liquidez y régimen
-INTERVAL_ENTRY = "5m"           # Para eventos
-INTERVAL_BIAS = "4h"            # Para tendencia de más largo plazo
+INTERVAL_MACRO = "1h"
+INTERVAL_ENTRY = "5m"
+INTERVAL_BIAS = "4h"
 
 # Parámetros de liquidez spot (usados internamente)
 LOOKBACK = 168
@@ -42,16 +42,16 @@ OI_CONFIANZA_BAJA = 100_000_000
 
 SPOT_FUTUROS_TOLERANCIA = 0.005
 
-# Radar 0 - Impulso (sin cambios en detección)
+# Radar 0 - Impulso
 IMPULSE_PRICE_CHANGE = 0.65
 IMPULSE_COOLDOWN = 300
 
 # Radar 3 - Sweep (umbrales más sensibles)
-SWEEP_VOLUME_FACTOR = 1.2        # Bajado de 1.5 para capturar más sweeps
-SWEEP_BREAK_MARGIN = 0.0005      # 0.05% de margen (más permisivo)
-SWEEP_PESO_MINIMO = 2            # Antes 3, ahora 2 (zonas con menos peso)
+SWEEP_VOLUME_FACTOR = 1.2
+SWEEP_BREAK_MARGIN = 0.0005
+SWEEP_PESO_MINIMO = 2
 
-# Radar 4 - Breakout (umbrales más sensibles)
+# Radar 4 - Breakout
 BREAKOUT_MARGIN = 0.003
 BREAKOUT_RETEST_CANDLES = 1
 BREAKOUT_PESO_MINIMO = 2
@@ -59,9 +59,9 @@ BREAKOUT_PESO_MINIMO = 2
 # Sistema de bias y scoring
 EMA_SHORT = 50
 EMA_LONG = 200
-SCORE_UMBRAL_ACCION_IMPULSO = 4     # Para Radar 0 (bajo)
-SCORE_UMBRAL_ACCION_SWEEP = 4       # Para Radar 3 (más sensible)
-SCORE_UMBRAL_ACCION_BREAKOUT = 4    # Para Radar 4
+SCORE_UMBRAL_ACCION_IMPULSO = 3      # Bajado de 4 para más setups
+SCORE_UMBRAL_ACCION_SWEEP = 3
+SCORE_UMBRAL_ACCION_BREAKOUT = 3
 SCORE_MAX_TEORICO = 30
 
 PESOS = {
@@ -320,7 +320,6 @@ def detectar_estructura(df, ventana=20):
     if df.empty or len(df) < ventana:
         return "NEUTRAL"
 
-    # Calcular máximos y mínimos locales (pivotes)
     highs = df["high"].values
     lows = df["low"].values
     pivot_highs = []
@@ -334,7 +333,6 @@ def detectar_estructura(df, ventana=20):
     if len(pivot_highs) < 2 and len(pivot_lows) < 2:
         return "NEUTRAL"
 
-    # Evaluar tendencia de pivotes
     tendencia_highs = all(pivot_highs[i] < pivot_highs[i+1] for i in range(len(pivot_highs)-1)) if len(pivot_highs) >= 2 else False
     tendencia_lows = all(pivot_lows[i] < pivot_lows[i+1] for i in range(len(pivot_lows)-1)) if len(pivot_lows) >= 2 else False
 
@@ -346,31 +344,23 @@ def detectar_estructura(df, ventana=20):
         return "NEUTRAL"
 
 def actualizar_regimen(df_estructura, hubo_impulso, resultado_impulso=None):
-    """
-    Actualiza el régimen actual basado en la estructura y el resultado del último impulso.
-    """
     global regimen_actual, ultimo_cambio_regimen, estructura_detected_at
     ahora = datetime.now(UTC)
 
-    # Si hubo un impulso, pasamos a modo IMPULSO (independientemente de estructura)
     if hubo_impulso:
         regimen_actual = "IMPULSO"
         ultimo_cambio_regimen = ahora
         return
 
-    # Si estamos en IMPULSO y ha pasado tiempo sin otro impulso, evaluamos si volver a estructura
     if regimen_actual == "IMPULSO" and ultimo_cambio_regimen and (ahora - ultimo_cambio_regimen) > timedelta(minutes=15):
-        # Si el último impulso fue un fracaso (resultado_scalp == FRACASO), cambiamos a estructura
         if resultado_impulso == "FRACASO":
             regimen_actual = detectar_estructura(df_estructura)
             ultimo_cambio_regimen = ahora
             estructura_detected_at = ahora
             return
         else:
-            # Mantenemos impulso hasta que pase más tiempo
             return
 
-    # Si no estamos en impulso, determinamos régimen por estructura
     if regimen_actual != "IMPULSO":
         estructura = detectar_estructura(df_estructura)
         if estructura != regimen_actual:
@@ -467,12 +457,11 @@ def detectar_zonas_oi(df_oi, df_spot):
     return clusters
 
 # =========================
-# RADARES INTERNOS (1 y 2) - solo alimentan datos
+# RADARES INTERNOS (1 y 2)
 # =========================
 
 def actualizar_zonas_internas(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_zona_spot_arriba, mejor_zona_spot_abajo, precio, hora, bias):
     global ultima_zona_arriba, ultima_zona_abajo
-    # Solo actualiza variables internas, no envía mensajes
     if mejor_zona_oi_arriba:
         ultima_zona_arriba = mejor_zona_oi_arriba["centro"]
     elif mejor_zona_spot_arriba and distancia(mejor_zona_spot_arriba, precio) >= RADAR1_MIN_DIST:
@@ -488,7 +477,6 @@ def actualizar_zonas_internas(mejor_zona_oi_arriba, mejor_zona_oi_abajo, mejor_z
         ultima_zona_abajo = None
 
 def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, bias):
-    # Solo actualiza alerted_proximidad para evitar spam en los radares externos
     global last_event_time
     ahora = datetime.now(UTC)
     def check_and_record(zona, tipo):
@@ -508,18 +496,16 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
         check_and_record(mejor_zona_abajo, "LOW")
 
 # =========================
-# RADAR 0 (IMPULSO) -> Genera setup
+# RADAR 0 (IMPULSO) - SIEMPRE INFORMA + SETUP OPCIONAL
 # =========================
 
 def generar_setup_impulso(zona, precio_actual, direccion, score_norm, riesgo_sugerido):
-    """Genera un setup operativo para impulso."""
     if zona is None:
         return None
     if direccion == "ALCISTA":
         entrada = round(precio_actual, 1)
-        # Stop ligeramente por debajo del mínimo de la zona o 0.3% si no hay zona
         stop_loss = round(zona["min"] * 0.997, 1)
-        take_profit = round(zona["centro"] * 1.008, 1)  # objetivo moderado
+        take_profit = round(zona["centro"] * 1.008, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
@@ -538,7 +524,7 @@ def generar_setup_impulso(zona, precio_actual, direccion, score_norm, riesgo_sug
 def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     global last_impulse_time, last_event_time, historial_eventos, regimen_actual
     if df_entry.empty or len(df_entry) < 3:
-        return
+        return False
 
     vela = df_entry.iloc[-1]
     try:
@@ -547,28 +533,28 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         volume = float(vela["volume"])
         vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
     except:
-        return
+        return False
 
     price_change = abs(close_price - open_price) / open_price * 100
     if price_change < IMPULSE_PRICE_CHANGE:
-        return
+        return False
 
     ahora = datetime.now(UTC)
     if last_impulse_time and (ahora - last_impulse_time).seconds < IMPULSE_COOLDOWN:
-        return
+        return False
 
     alcista = close_price > open_price
     direccion = "ALCISTA" if alcista else "BAJISTA"
     emoji = "🟢" if alcista else "🔴"
 
-    # Zona relevante en la dirección
+    # Zona relevante
     zona_relevante = None
     if alcista and zonas_arriba:
         zona_relevante = zonas_arriba[0]
     elif not alcista and zonas_abajo:
         zona_relevante = zonas_abajo[0]
 
-    # Calcular score (solo para contexto)
+    # Calcular score
     peso_zona = 0
     validacion_spot = False
     if zona_relevante:
@@ -602,36 +588,33 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     }
     historial_eventos.append(evento)
 
-    # Generar setup solo si el score supera el umbral
-    if score_norm >= SCORE_UMBRAL_ACCION_IMPULSO:
-        # Riesgo según régimen
-        riesgo_sugerido = 1.0 if regimen_actual == "IMPULSO" else 0.5
+    # Construir mensaje informativo siempre
+    riesgo_sugerido = 1.0 if regimen_actual == "IMPULSO" else 0.5
+    setup = None
+    if zona_relevante and score_norm >= SCORE_UMBRAL_ACCION_IMPULSO:
         setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm, riesgo_sugerido)
-        if setup:
-            msg = f"🚀 **SETUP {direccion} (IMPULSO)** – Score {score_norm}/10\n\n"
-            msg += f"Entrada sugerida: {fmt(setup['entrada'])}\n"
-            msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['entrada']-setup['stop_loss'])/setup['entrada']*100:.2f}%)\n"
-            msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['take_profit']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-            msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
-            msg += f"Confianza: {setup['confianza']}\n\n"
-            msg += f"Contexto: variación {price_change:.2f}%, volumen {volume:.0f} BTC ({volume/vol_medio:.1f}x media), bias {bias}"
-            if zona_relevante:
-                msg += f", zona objetivo {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
-            enviar(msg)
-        else:
-            # Si no hay zona, al menos informamos del impulso con datos clave
-            msg = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10\n\n"
-            msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
-            msg += f"Variación: {price_change:.2f}%\n"
-            msg += f"Volumen: {volume:.0f} BTC ({volume/vol_medio:.1f}x media)\n"
-            msg += f"Bias: {bias}"
-            if zona_relevante:
-                msg += f"\nZona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
-            enviar(msg)
+
+    titulo = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10"
+    msg = f"{titulo}\n\n"
+    msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
+    msg += f"Variación: {price_change:.2f}%\n"
+    msg += f"Volumen: {volume:.0f} BTC ({volume/vol_medio:.1f}x media)\n"
+    msg += f"Bias: {bias}"
+    if zona_relevante:
+        msg += f"\nZona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
+    if setup:
+        msg += f"\n\n👉 **SETUP SUGERIDO**\n"
+        msg += f"Acción: {setup['accion']}\n"
+        msg += f"Entrada: {fmt(setup['entrada'])}\n"
+        msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['entrada']-setup['stop_loss'])/setup['entrada']*100:.2f}%)\n"
+        msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['take_profit']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
+        msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
+        msg += f"Confianza: {setup['confianza']}"
+    enviar(msg)
 
     last_impulse_time = ahora
     last_event_time = ahora
-    return True  # indica que hubo impulso
+    return True
 
 # =========================
 # RADAR 3 (SWEEP) -> Genera setup de reversión
@@ -676,7 +659,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             sweep_pendiente = None
             return
 
-        # Calcular score
         peso_zona = calcular_peso_zona(zona if 'toques' in zona else None,
                                         zona if 'oi_total' in zona else None, precio_actual)
         validacion_spot = False
@@ -711,7 +693,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         }
         historial_eventos.append(evento)
 
-        # Setup con riesgo según régimen
         riesgo_sugerido = 1.0 if regimen_actual == "IMPULSO" else 0.5
         setup = generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm, riesgo_sugerido)
         if setup:
@@ -766,7 +747,7 @@ def generar_setup_breakout(zona, precio_actual, direccion, score_norm, riesgo_su
     if direccion == "ALCISTA":
         entrada = round(precio_actual, 1)
         stop_loss = round(zona["min"] * 0.997, 1)
-        take_profit = round(zona["centro"] * 1.015, 1)  # objetivo más amplio
+        take_profit = round(zona["centro"] * 1.015, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
@@ -911,7 +892,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen actual: {regimen_actual}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.1)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen actual: {regimen_actual}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -989,12 +970,11 @@ def generar_informe_resultados_como_texto():
     if df_scalp.empty and df_tend.empty:
         return None
 
-    informe = "📊 **INFORME DE RESULTADOS (V13)**\n\n"
+    informe = "📊 **INFORME DE RESULTADOS (V13.1)**\n\n"
 
     for tipo in df["tipo"].unique():
         informe += f"🔹 {tipo.upper()}\n"
 
-        # Scalping (3v)
         subset = df_scalp[df_scalp["tipo"] == tipo]
         if not subset.empty:
             total = len(subset)
@@ -1003,7 +983,6 @@ def generar_informe_resultados_como_texto():
             neutros = len(subset[subset["resultado_scalp"] == "NEUTRO"])
             tasa = exitos / total * 100 if total else 0
             informe += f"   ⏱️ Scalping (3v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
-            # Desglose por volumen
             if "volumen" in subset.columns:
                 vol_bajo = subset[subset["volumen"] < 300]
                 vol_medio = subset[(subset["volumen"] >= 300) & (subset["volumen"] <= 600)]
@@ -1021,7 +1000,6 @@ def generar_informe_resultados_como_texto():
                     to = len(vol_alto)
                     informe += f"      📊 Vol >600: {to} ops, éxito {ex/to*100:.1f}%\n"
 
-        # Tendencia (12v)
         subset = df_tend[df_tend["tipo"] == tipo]
         if not subset.empty:
             total = len(subset)
@@ -1090,7 +1068,7 @@ def evaluar():
 
     bias = calcular_bias(df_1h, df_4h, precio)
 
-    # Detectar zonas (internas)
+    # Detectar zonas
     zonas_high_spot, zonas_low_spot = detectar_zonas_spot(df_1h) if not df_1h.empty else ([], [])
     mejor_spot_arriba, mejor_spot_abajo = seleccionar_mejores_zonas_spot(zonas_high_spot, zonas_low_spot, precio)
 
@@ -1107,10 +1085,10 @@ def evaluar():
             abajo_oi.sort(key=lambda x: x["oi_total"], reverse=True)
             mejor_oi_abajo = abajo_oi[0]
 
-    # Actualizar zonas internas (Radar 1 silencioso)
+    # Actualizar zonas internas (Radar 1)
     actualizar_zonas_internas(mejor_oi_arriba, mejor_oi_abajo, mejor_spot_arriba, mejor_spot_abajo, precio, hora_str, bias)
 
-    # Radar 2 silencioso (solo cooldown)
+    # Radar 2 interno
     zona_ref_arriba = mejor_oi_arriba if mejor_oi_arriba else mejor_spot_arriba
     zona_ref_abajo = mejor_oi_abajo if mejor_oi_abajo else mejor_spot_abajo
     radar_proximidad_interno(zona_ref_arriba, zona_ref_abajo, precio, hora_str, bias)
@@ -1119,7 +1097,7 @@ def evaluar():
     zonas_arriba = [z for z in ([mejor_oi_arriba] if mejor_oi_arriba else []) + ([mejor_spot_arriba] if mejor_spot_arriba else []) if z]
     zonas_abajo = [z for z in ([mejor_oi_abajo] if mejor_oi_abajo else []) + ([mejor_spot_abajo] if mejor_spot_abajo else []) if z]
 
-    # Ejecutar Radar 0 y obtener si hubo impulso
+    # Radar 0 (siempre informa)
     hubo_impulso = radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias)
 
     # Detectar resultado del último impulso (para transición)
@@ -1132,11 +1110,11 @@ def evaluar():
     # Actualizar régimen
     actualizar_regimen(df_1h, hubo_impulso, resultado_impulso)
 
-    # Ejecutar Radars 3 y 4 (generan setups si aplica)
+    # Radar 3 y 4 (generan setups)
     radar_sweep(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
     radar_breakout(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
 
-    # Limpieza de alerted_proximidad (más de 2h)
+    # Limpieza de alerted_proximidad
     keys_a_remover = []
     for key, ts in alerted_proximidad.items():
         if (ahora - ts) > timedelta(hours=2):
@@ -1153,10 +1131,10 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V13 (con régimen y setups operativos)...")
+    print("🚀 Iniciando BOT V13.1 (impulsos siempre informan)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.1)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)

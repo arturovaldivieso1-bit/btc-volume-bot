@@ -19,11 +19,11 @@ CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTCUSDT"
 
 # Timeframes
-INTERVAL_MACRO = "1h"
-INTERVAL_ENTRY = "5m"
-INTERVAL_BIAS = "4h"
+INTERVAL_MACRO = "1h"          # para detección de estructura y zonas macro (2 semanas)
+INTERVAL_ENTRY = "5m"           # para eventos
+INTERVAL_BIAS = "4h"            # para tendencia macro (opcional)
 
-# Parámetros de liquidez spot
+# Parámetros de liquidez spot (usados internamente)
 LOOKBACK = 168
 MIN_TOUCHES = 3
 CLUSTER_RANGE = 0.0025
@@ -42,17 +42,18 @@ OI_CONFIANZA_BAJA = 100_000_000
 
 SPOT_FUTUROS_TOLERANCIA = 0.005
 
-# Radar 0 – solo variación de precio ≥0.65%
+# Radar 0 – solo variación de precio =0.65%
 IMPULSE_PRICE_CHANGE = 0.65
 IMPULSE_COOLDOWN = 300
 
-# Radar 3 y 4
+# Radar 3 y 4 – filtro principal por volumen
 SWEEP_VOLUME_FACTOR = 1.2
 SWEEP_BREAK_MARGIN = 0.0005
 SWEEP_PESO_MINIMO = 2
 BREAKOUT_MARGIN = 0.003
 BREAKOUT_RETEST_CANDLES = 1
 BREAKOUT_PESO_MINIMO = 2
+VOL_MIN_SWEEP = 400               # si volumen > 400 BTC, se genera setup automáticamente
 
 # Umbrales de volumen (BTC) y probabilidades de continuación (estudio)
 VOL1_MED = 400
@@ -76,11 +77,11 @@ PROB3_MED = 75
 PROB3_P75 = 86
 PROB3_P90 = 89
 
-# Scoring y bias
+# Scoring y bias (ahora solo para confianza, no bloquean)
 EMA_SHORT = 50
 EMA_LONG = 200
-SCORE_UMBRAL_ACCION_IMPULSO = 3    # setup solo si hay zona y score ≥3
-SCORE_UMBRAL_ACCION_SWEEP = 2
+SCORE_UMBRAL_ACCION_IMPULSO = 3      # para setup de impulso (solo si hay zona)
+SCORE_UMBRAL_ACCION_SWEEP = 2        # muy bajo, para no bloquear
 SCORE_UMBRAL_ACCION_BREAKOUT = 2
 SCORE_MAX_TEORICO = 30
 
@@ -95,7 +96,7 @@ PESOS = {
     "evento_sweep": 2,
     "evento_breakout": 2,
     "validacion_spot": 2,
-    "volumen_alto": 3
+    "volumen_alto": 3      # base, se añadirá bonificación por percentil
 }
 
 def peso_por_oi(oi_total):
@@ -108,6 +109,16 @@ def peso_por_oi(oi_total):
     else:
         return 1
 
+def bonificacion_volumen(volumen):
+    if volumen > VOL1_P90:
+        return 10
+    elif volumen > VOL1_P75:
+        return 6
+    elif volumen > VOL1_MED:
+        return 3
+    else:
+        return 0
+
 # Sistema
 HEARTBEAT_HOURS = 4
 NO_EVENT_HOURS = 6
@@ -115,12 +126,15 @@ MAPA_COOLDOWN_MINUTOS = 60
 RADAR2_COOLDOWN_MINUTOS = 120
 REDONDEO_BASE = 200
 
-# ML Manual
+# ML Manual – evaluación
+EVALUACION_VELAS_SCALP = 2        # 2 velas = 10 minutos
+EVALUACION_VELAS_TEND = 6         # 6 velas = 30 minutos
+EVALUACION_VELAS_LARGA = 12       # 12 velas = 1 hora (secundaria)
+RANGO_EXITO_SCALP = 0.003         # 0.3%
+RANGO_EXITO_TEND = 0.005          # 0.5%
+RANGO_EXITO_LARGA = 0.01          # 1.0% (opcional)
+
 HISTORIAL_FILE = "historial_eventos.json"
-EVALUACION_VELAS_SCALP = 3
-EVALUACION_VELAS_TEND = 12
-RANGO_EXITO_SCALP = 0.004
-RANGO_EXITO_TEND = 0.005
 
 # Variables de estado
 last_impulse_time = None
@@ -138,10 +152,14 @@ oi_increment_history = []
 historial_eventos = deque(maxlen=2000)
 ultimos_eventos = deque(maxlen=10)
 
-# Régimen
+# Régimen y zonas macro para Radar 5
 regimen_actual = "NEUTRAL"
 ultimo_cambio_regimen = None
 estructura_detected_at = None
+zonas_macro = []   # almacenará clusters de soporte/resistencia en 1h (2 semanas)
+
+# Cooldown para zonas macro (evita spam)
+alerted_macro_zones = {}   # clave = (centro_redondeado, direccion)  valor = timestamp
 
 # =========================
 # FUNCIONES AUXILIARES
@@ -181,12 +199,12 @@ def obtener_precio_actual():
     except:
         return None
 
-def cluster_precios(lista):
+def cluster_precios(lista, rango=CLUSTER_RANGE):
     clusters = []
     for p in sorted(lista):
         agregado = False
         for c in clusters:
-            if abs(p - c["centro"]) / p < CLUSTER_RANGE:
+            if abs(p - c["centro"]) / p < rango:
                 c["valores"].append(p)
                 c["centro"] = sum(c["valores"]) / len(c["valores"])
                 agregado = True
@@ -195,16 +213,16 @@ def cluster_precios(lista):
             clusters.append({"centro": p, "valores": [p]})
     return clusters
 
-def detectar_zonas_spot(df):
-    if df.empty or len(df) < LOOKBACK:
+def detectar_zonas_spot(df, lookback=LOOKBACK, min_toques=MIN_TOUCHES, rango=CLUSTER_RANGE):
+    if df.empty or len(df) < lookback:
         return [], []
-    highs = df["high"].tail(LOOKBACK).tolist()
-    lows = df["low"].tail(LOOKBACK).tolist()
-    clusters_high = cluster_precios(highs)
-    clusters_low = cluster_precios(lows)
+    highs = df["high"].tail(lookback).tolist()
+    lows = df["low"].tail(lookback).tolist()
+    clusters_high = cluster_precios(highs, rango)
+    clusters_low = cluster_precios(lows, rango)
     zonas_high = []
     for c in clusters_high:
-        if len(c["valores"]) >= MIN_TOUCHES:
+        if len(c["valores"]) >= min_toques:
             zonas_high.append({
                 "tipo": "HIGH",
                 "centro": c["centro"],
@@ -214,7 +232,7 @@ def detectar_zonas_spot(df):
             })
     zonas_low = []
     for c in clusters_low:
-        if len(c["valores"]) >= MIN_TOUCHES:
+        if len(c["valores"]) >= min_toques:
             zonas_low.append({
                 "tipo": "LOW",
                 "centro": c["centro"],
@@ -320,8 +338,8 @@ def calcular_score_evento(evento_tipo, direccion_evento, bias, peso_zona, valida
             score += PESOS["bias_favorable_lateral"]
     elif bias == direccion_evento:
         score += PESOS["bias_favorable_tendencia"]
-    if volumen and volumen > VOL1_MED:
-        score += PESOS["volumen_alto"]
+    if volumen:
+        score += bonificacion_volumen(volumen)
     return score
 
 def obtener_probabilidad(volumen, umbrales, probabilidades):
@@ -339,17 +357,23 @@ def registrar_evento_para_patron(tipo, direccion):
     ultimos_eventos.append(clave)
     if len(ultimos_eventos) >= 3:
         if all(e == f"sweep_{direccion}" for e in list(ultimos_eventos)[-3:]):
-            enviar(f"⚠️ POSIBLE ACUMULACIÓN: 3 sweeps {direccion} consecutivos")
+            enviar(f"?? POSIBLE ACUMULACIÓN: 3 sweeps {direccion} consecutivos")
 
 # =========================
-# DETECCIÓN DE RÉGIMEN (ventana 72 velas = 3 días en 1h)
+# DETECCIÓN DE RÉGIMEN Y ZONAS MACRO (1h, 2 semanas)
 # =========================
 
-def detectar_estructura(df, ventana=72):
-    if df.empty or len(df) < ventana:
-        return "NEUTRAL"
-    highs = df["high"].values[-ventana:]
-    lows = df["low"].values[-ventana:]
+def detectar_estructura_y_zonas(df_1h):
+    """
+    Detecta régimen de mercado (ACUMULACION/DISTRIBUCION/NEUTRAL) y
+    extrae zonas macro de soporte/resistencia usando 336 velas (2 semanas).
+    """
+    if df_1h.empty or len(df_1h) < 336:
+        return "NEUTRAL", []
+
+    # 1. Detectar régimen por pivotes (últimas 336 velas)
+    highs = df_1h["high"].values[-336:]
+    lows = df_1h["low"].values[-336:]
     pivot_highs = []
     pivot_lows = []
     for i in range(1, len(highs)-1):
@@ -358,18 +382,28 @@ def detectar_estructura(df, ventana=72):
         if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
             pivot_lows.append(lows[i])
     if len(pivot_highs) < 2 and len(pivot_lows) < 2:
-        return "NEUTRAL"
-    tendencia_highs = all(pivot_highs[i] < pivot_highs[i+1] for i in range(len(pivot_highs)-1)) if len(pivot_highs) >= 2 else False
-    tendencia_lows = all(pivot_lows[i] < pivot_lows[i+1] for i in range(len(pivot_lows)-1)) if len(pivot_lows) >= 2 else False
-    if tendencia_highs and tendencia_lows:
-        return "ACUMULACION"
-    elif (not tendencia_highs) and (not tendencia_lows):
-        return "DISTRIBUCION"
+        regimen = "NEUTRAL"
     else:
-        return "NEUTRAL"
+        tendencia_highs = all(pivot_highs[i] < pivot_highs[i+1] for i in range(len(pivot_highs)-1)) if len(pivot_highs) >= 2 else False
+        tendencia_lows = all(pivot_lows[i] < pivot_lows[i+1] for i in range(len(pivot_lows)-1)) if len(pivot_lows) >= 2 else False
+        if tendencia_highs and tendencia_lows:
+            regimen = "ACUMULACION"
+        elif (not tendencia_highs) and (not tendencia_lows):
+            regimen = "DISTRIBUCION"
+        else:
+            regimen = "NEUTRAL"
 
-def actualizar_regimen(df_estructura, hubo_impulso, resultado_impulso=None):
-    global regimen_actual, ultimo_cambio_regimen, estructura_detected_at
+    # 2. Detectar zonas macro (soporte/resistencia) con un rango de agrupación más amplio (0.5%)
+    zonas_macro = []
+    # Usamos la misma función detectar_zonas_spot con lookback=336 y rango=0.005
+    zonas_high, zonas_low = detectar_zonas_spot(df_1h, lookback=336, min_toques=3, rango=0.005)
+    # Unir ambas listas y ordenar por toques
+    zonas_macro = zonas_high + zonas_low
+    zonas_macro.sort(key=lambda x: x["toques"], reverse=True)
+    return regimen, zonas_macro[:5]   # guardamos hasta 5 zonas
+
+def actualizar_regimen(df_1h, hubo_impulso, resultado_impulso=None):
+    global regimen_actual, ultimo_cambio_regimen, estructura_detected_at, zonas_macro
     ahora = datetime.now(UTC)
     if hubo_impulso:
         regimen_actual = "IMPULSO"
@@ -377,16 +411,17 @@ def actualizar_regimen(df_estructura, hubo_impulso, resultado_impulso=None):
         return
     if regimen_actual == "IMPULSO" and ultimo_cambio_regimen and (ahora - ultimo_cambio_regimen) > timedelta(minutes=15):
         if resultado_impulso == "FRACASO":
-            regimen_actual = detectar_estructura(df_estructura)
+            nuevo_regimen, zonas_macro = detectar_estructura_y_zonas(df_1h)
+            regimen_actual = nuevo_regimen
             ultimo_cambio_regimen = ahora
             estructura_detected_at = ahora
         return
     if regimen_actual != "IMPULSO":
-        estructura = detectar_estructura(df_estructura)
-        if estructura != regimen_actual:
-            regimen_actual = estructura
+        nuevo_regimen, zonas_macro = detectar_estructura_y_zonas(df_1h)
+        if nuevo_regimen != regimen_actual:
+            regimen_actual = nuevo_regimen
             ultimo_cambio_regimen = ahora
-            if estructura in ["ACUMULACION", "DISTRIBUCION"]:
+            if regimen_actual in ["ACUMULACION", "DISTRIBUCION"]:
                 estructura_detected_at = ahora
 
 # =========================
@@ -469,11 +504,11 @@ def detectar_zonas_oi(df_oi, df_spot):
     clusters = cluster_oi_por_precio(eventos)
     for c in clusters:
         if c["oi_total"] > OI_CONFIANZA_ALTA:
-            c["confianza"] = "🔥🔥🔥"
+            c["confianza"] = "??????"
         elif c["oi_total"] > OI_CONFIANZA_MEDIA:
-            c["confianza"] = "🔥🔥"
+            c["confianza"] = "????"
         else:
-            c["confianza"] = "🔥"
+            c["confianza"] = "??"
     return clusters
 
 # =========================
@@ -515,29 +550,29 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
         check_and_record(mejor_zona_abajo, "LOW")
 
 # =========================
-# RADAR 0 – ACTIVACIÓN POR VARIACIÓN DE PRECIO ≥0.65%
+# RADAR 0 – IMPULSO (siempre informa, setup si volumen alto o score)
 # =========================
 
-def generar_setup_impulso(zona, precio_actual, direccion, score_norm, riesgo_sugerido):
+def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
     if zona is None:
         return None
     if direccion == "ALCISTA":
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["min"] * 0.997, 1)
-        take_profit = round(zona["centro"] * 1.008, 1)
+        sl = round(zona["min"] * 0.997, 1)
+        tp = round(zona["centro"] * 1.008, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["max"] * 1.003, 1)
-        take_profit = round(zona["centro"] * 0.992, 1)
+        sl = round(zona["max"] * 1.003, 1)
+        tp = round(zona["centro"] * 0.992, 1)
         accion = "VENTA (SHORT)"
+    confianza = "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
     return {
         "accion": accion,
         "entrada": entrada,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "riesgo": riesgo_sugerido,
-        "confianza": "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
+        "sl": sl,
+        "tp": tp,
+        "confianza": confianza
     }
 
 def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
@@ -564,21 +599,21 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
 
     alcista = close_price > open_price
     direccion = "ALCISTA" if alcista else "BAJISTA"
-    emoji = "🟢" if alcista else "🔴"
+    emoji = "??" if alcista else "??"
 
-    # Zona relevante (solo para contexto y posible setup)
+    # Zona relevante (solo para contexto)
     zona_relevante = None
     if alcista and zonas_arriba:
         zona_relevante = zonas_arriba[0]
     elif not alcista and zonas_abajo:
         zona_relevante = zonas_abajo[0]
 
-    # Calcular probabilidades de continuación (1,2,3 velas con misma dirección)
+    # Probabilidades de continuación (1,2,3 velas misma dirección)
     prob_lines = []
     vol1 = volume
     prob1 = obtener_probabilidad(vol1, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
     if prob1:
-        prob_lines.append(f"  1 vela ({vol1:.0f} BTC): {prob1}%")
+        prob_lines.append(f"  1v ({vol1:.0f}): {prob1}%")
 
     if len(df_entry) >= 2:
         vela_ant = df_entry.iloc[-2]
@@ -587,7 +622,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
             vol2 = vol1 + vela_ant["volume"]
             prob2 = obtener_probabilidad(vol2, [VOL2_MED, VOL2_P75, VOL2_P90], [PROB2_MED, PROB2_P75, PROB2_P90])
             if prob2:
-                prob_lines.append(f"  2 velas (misma dir, {vol2:.0f} BTC): {prob2}%")
+                prob_lines.append(f"  2v (misma dir, {vol2:.0f}): {prob2}%")
 
     if len(df_entry) >= 3:
         vela_ant2 = df_entry.iloc[-3]
@@ -596,12 +631,12 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
             vol3 = vol1 + df_entry.iloc[-2]["volume"] + df_entry.iloc[-3]["volume"]
             prob3 = obtener_probabilidad(vol3, [VOL3_MED, VOL3_P75, VOL3_P90], [PROB3_MED, PROB3_P75, PROB3_P90])
             if prob3:
-                prob_lines.append(f"  3 velas (misma dir, {vol3:.0f} BTC): {prob3}%")
+                prob_lines.append(f"  3v (misma dir, {vol3:.0f}): {prob3}%")
 
     if not prob_lines:
-        prob_lines.append(f"  Volumen insuficiente: probabilidad base 68%")
+        prob_lines.append(f"  Volumen insuficiente: prob base 68%")
 
-    # Registrar evento (para estadísticas)
+    # Registrar evento
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "impulso",
@@ -613,14 +648,16 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         "volumen_ratio": volume / vol_medio if vol_medio else 1.0,
         "zona_centro": zona_relevante['centro'] if zona_relevante else None,
         "resultado_scalp": None,
-        "resultado_tendencia": None,
+        "resultado_tend": None,
+        "resultado_largo": None,
         "evaluado_scalp": False,
-        "evaluado_tendencia": False,
+        "evaluado_tend": False,
+        "evaluado_largo": False,
         "evaluado": False
     }
     historial_eventos.append(evento)
 
-    # Calcular score para setup (solo si hay zona)
+    # Calcular score y setup (solo si hay zona)
     score_norm = 0
     setup = None
     if zona_relevante:
@@ -636,27 +673,25 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         score_norm = normalizar_score(score_abs)
         evento["score_abs"] = score_abs
         evento["score_norm"] = score_norm
-        if score_norm >= SCORE_UMBRAL_ACCION_IMPULSO:
-            riesgo = 1.0 if regimen_actual == "IMPULSO" else 0.5
-            setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm, riesgo)
+        # Setup si volumen >400 o score suficiente
+        if volume > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_ACCION_IMPULSO:
+            setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm)
 
-    # Mensaje
-    titulo = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10"
+    # Mensaje simplificado
+    titulo = f"?? **IMPULSO {direccion} {emoji}** – Score {score_norm}/10"
     msg = f"{titulo}\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
     msg += f"Variación: {price_change:.2f}%\n"
-    msg += f"Volumen actual: {vol1:.2f} BTC ({(vol1/vol_medio):.1f}x media)\n"
+    msg += f"Volumen: {vol1:.0f} BTC ({(vol1/vol_medio):.1f}x media)\n"
     msg += f"Bias: {bias}\n\n"
-    msg += f"📊 Probabilidad de continuación (sin retroceso):\n" + "\n".join(prob_lines)
+    msg += f"?? Probabilidad:\n" + "\n".join(prob_lines)
     if zona_relevante:
-        msg += f"\nZona objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
+        msg += f"\nZ objetivo: {fmt(zona_relevante['centro'])} ({distancia(zona_relevante, precio_actual)*100:.1f}%)"
     if setup:
-        msg += f"\n\n👉 **SETUP SUGERIDO**\n"
-        msg += f"Acción: {setup['accion']}\n"
+        msg += f"\n\n?? **SETUP**\n"
         msg += f"Entrada: {fmt(setup['entrada'])}\n"
-        msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['entrada']-setup['stop_loss'])/setup['entrada']*100:.2f}%)\n"
-        msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['take_profit']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-        msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
+        msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
+        msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
         msg += f"Confianza: {setup['confianza']}"
     enviar(msg)
 
@@ -665,29 +700,29 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     return True
 
 # =========================
-# RADAR 3 (SWEEP) – basado en volumen (estudio)
+# RADAR 3 (SWEEP) – setup si volumen >400 o score suficiente
 # =========================
 
-def generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm, riesgo_sugerido):
+def generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm):
     if zona is None:
         return None
     if direccion_rev == "ALCISTA":
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["min"] * 0.997, 1)
-        take_profit = round(zona["centro"] * 1.008, 1)
+        sl = round(zona["min"] * 0.997, 1)
+        tp = round(zona["centro"] * 1.008, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["max"] * 1.003, 1)
-        take_profit = round(zona["centro"] * 0.992, 1)
+        sl = round(zona["max"] * 1.003, 1)
+        tp = round(zona["centro"] * 0.992, 1)
         accion = "VENTA (SHORT)"
+    confianza = "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
     return {
         "accion": accion,
         "entrada": entrada,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "riesgo": riesgo_sugerido,
-        "confianza": "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
+        "sl": sl,
+        "tp": tp,
+        "confianza": confianza
     }
 
 def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
@@ -699,10 +734,10 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         zona, tipo_sweep = sweep_pendiente
         if tipo_sweep == "HIGH" and vela_actual["close"] < vela_actual["open"]:
             direccion_rev = "BAJISTA"
-            emoji_rev = "🔴"
+            emoji_rev = "??"
         elif tipo_sweep == "LOW" and vela_actual["close"] > vela_actual["open"]:
             direccion_rev = "ALCISTA"
-            emoji_rev = "🟢"
+            emoji_rev = "??"
         else:
             sweep_pendiente = None
             return
@@ -710,13 +745,11 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         vela_sweep = df_entry.iloc[-2]
         vol_sweep = vela_sweep["volume"]
 
-        # Probabilidades de continuación (1 vela del sweep)
-        prob_lines = []
+        # Probabilidad de continuación
         prob1 = obtener_probabilidad(vol_sweep, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
-        if prob1:
-            prob_lines.append(f"  Volumen barrido: {vol_sweep:.0f} BTC -> {prob1}%")
+        prob_line = f"  Volumen: {vol_sweep:.0f} BTC -> {prob1}%" if prob1 else "  Volumen bajo, prob base 68%"
 
-        # Calcular score y setup
+        # Calcular score (solo para confianza)
         peso_zona = calcular_peso_zona(zona if 'toques' in zona else None,
                                         zona if 'oi_total' in zona else None, precio_actual)
         validacion_spot = False
@@ -728,13 +761,9 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         score_abs = calcular_score_evento("sweep", direccion_rev, bias, peso_zona, validacion_spot, vol_sweep)
         score_norm = normalizar_score(score_abs)
 
-        if score_norm < SCORE_UMBRAL_ACCION_SWEEP:
-            sweep_pendiente = None
-            return
-
-        registrar_evento_para_patron("sweep", direccion_rev)
+        # Registrar evento
         ahora = datetime.now(UTC)
-        color_zona = "🟢" if tipo_sweep == "HIGH" else "🔴"
+        color_zona = "??" if tipo_sweep == "HIGH" else "??"
         evento = {
             "timestamp": ahora.isoformat(),
             "tipo": "sweep",
@@ -745,27 +774,28 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             "volumen": vol_sweep,
             "zona_centro": zona['centro'],
             "resultado_scalp": None,
-            "resultado_tendencia": None,
+            "resultado_tend": None,
+            "resultado_largo": None,
             "evaluado_scalp": False,
-            "evaluado_tendencia": False,
+            "evaluado_tend": False,
+            "evaluado_largo": False,
             "evaluado": False
         }
         historial_eventos.append(evento)
 
-        riesgo = 1.0 if regimen_actual == "IMPULSO" else 0.5
-        setup = generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm, riesgo)
-        if setup:
-            msg = f"🔄 **SETUP REVERSIÓN {direccion_rev} (SWEEP)** – Score {score_norm}/10\n\n"
-            msg += f"Entrada sugerida: {fmt(setup['entrada'])}\n"
-            msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['entrada']-setup['stop_loss'])/setup['entrada']*100:.2f}%)\n"
-            msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['take_profit']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-            msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
-            msg += f"Confianza: {setup['confianza']}\n\n"
-            msg += f"Zona barrida: {fmt(zona['centro'])} | Precio actual: {fmt(precio_actual)} | Hora: {ahora.strftime('%H:%M')}\n"
-            msg += f"Volumen sweep: {vol_sweep:.0f} BTC\n"
-            msg += f"Probabilidad de continuación:\n" + "\n".join(prob_lines) + "\n"
-            msg += f"Bias: {bias}"
-            enviar(msg)
+        # Setup si volumen >400 o score suficiente
+        if vol_sweep > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_ACCION_SWEEP:
+            setup = generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm)
+            if setup:
+                msg = f"?? **SETUP REVERSIÓN {direccion_rev} (SWEEP)** – Score {score_norm}/10\n\n"
+                msg += f"Entrada: {fmt(setup['entrada'])}\n"
+                msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
+                msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
+                msg += f"Confianza: {setup['confianza']}\n\n"
+                msg += f"Z barrida: {fmt(zona['centro'])} | P. actual: {fmt(precio_actual)} | Hora: {ahora.strftime('%H:%M')}\n"
+                msg += f"Volumen: {vol_sweep:.0f} BTC\n{prob_line}\n"
+                msg += f"Bias: {bias}"
+                enviar(msg)
 
         last_event_time = ahora
         sweep_pendiente = None
@@ -799,29 +829,29 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                 break
 
 # =========================
-# RADAR 4 (BREAKOUT) – basado en volumen (estudio)
+# RADAR 4 (BREAKOUT) – setup si volumen >400 o score suficiente
 # =========================
 
-def generar_setup_breakout(zona, precio_actual, direccion, score_norm, riesgo_sugerido):
+def generar_setup_breakout(zona, precio_actual, direccion, score_norm):
     if zona is None:
         return None
     if direccion == "ALCISTA":
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["min"] * 0.997, 1)
-        take_profit = round(zona["centro"] * 1.015, 1)
+        sl = round(zona["min"] * 0.997, 1)
+        tp = round(zona["centro"] * 1.015, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
-        stop_loss = round(zona["max"] * 1.003, 1)
-        take_profit = round(zona["centro"] * 0.985, 1)
+        sl = round(zona["max"] * 1.003, 1)
+        tp = round(zona["centro"] * 0.985, 1)
         accion = "VENTA (SHORT)"
+    confianza = "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
     return {
         "accion": accion,
         "entrada": entrada,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "riesgo": riesgo_sugerido,
-        "confianza": "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
+        "sl": sl,
+        "tp": tp,
+        "confianza": confianza
     }
 
 def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
@@ -859,7 +889,7 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                                 break
                     score_abs = calcular_score_evento("breakout", "ALCISTA", bias, peso_zona, validacion_spot, vol_break)
                     score_norm = normalizar_score(score_abs)
-                    if score_norm >= SCORE_UMBRAL_ACCION_BREAKOUT:
+                    if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_ACCION_BREAKOUT:
                         alerted_liquidity.add(key)
                         zona_consumida = True
                         evento = {
@@ -872,25 +902,25 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                             "volumen": vol_break,
                             "zona_centro": mejor_zona_arriba['centro'],
                             "resultado_scalp": None,
-                            "resultado_tendencia": None,
+                            "resultado_tend": None,
+                            "resultado_largo": None,
                             "evaluado_scalp": False,
-                            "evaluado_tendencia": False,
+                            "evaluado_tend": False,
+                            "evaluado_largo": False,
                             "evaluado": False
                         }
                         historial_eventos.append(evento)
                         registrar_evento_para_patron("breakout", "ALCISTA")
-                        riesgo = 1.0 if regimen_actual == "IMPULSO" else 0.5
-                        setup = generar_setup_breakout(mejor_zona_arriba, close, "ALCISTA", score_norm, riesgo)
+                        setup = generar_setup_breakout(mejor_zona_arriba, close, "ALCISTA", score_norm)
                         if setup:
                             prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
-                            prob_line = f"Probabilidad continuación: {prob}%" if prob else "Volumen bajo, probabilidad base 68%"
-                            msg = f"🌋 **SETUP {setup['accion']} (BREAKOUT ALCISTA)** – Score {score_norm}/10\n\n"
-                            msg += f"Entrada sugerida: {fmt(setup['entrada'])}\n"
-                            msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['entrada']-setup['stop_loss'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['take_profit']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
+                            prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
+                            msg = f"?? **SETUP {setup['accion']} (BREAKOUT ALCISTA)** – Score {score_norm}/10\n\n"
+                            msg += f"Entrada: {fmt(setup['entrada'])}\n"
+                            msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
+                            msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
                             msg += f"Confianza: {setup['confianza']}\n\n"
-                            msg += f"Zona rota: {fmt(mejor_zona_arriba['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
+                            msg += f"Z rota: {fmt(mejor_zona_arriba['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
                             msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
                             msg += f"Bias: {bias}"
                             enviar(msg)
@@ -912,7 +942,7 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                                 break
                     score_abs = calcular_score_evento("breakout", "BAJISTA", bias, peso_zona, validacion_spot, vol_break)
                     score_norm = normalizar_score(score_abs)
-                    if score_norm >= SCORE_UMBRAL_ACCION_BREAKOUT:
+                    if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_ACCION_BREAKOUT:
                         alerted_liquidity.add(key)
                         zona_consumida = True
                         evento = {
@@ -925,30 +955,117 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
                             "volumen": vol_break,
                             "zona_centro": mejor_zona_abajo['centro'],
                             "resultado_scalp": None,
-                            "resultado_tendencia": None,
+                            "resultado_tend": None,
+                            "resultado_largo": None,
                             "evaluado_scalp": False,
-                            "evaluado_tendencia": False,
+                            "evaluado_tend": False,
+                            "evaluado_largo": False,
                             "evaluado": False
                         }
                         historial_eventos.append(evento)
                         registrar_evento_para_patron("breakout", "BAJISTA")
-                        riesgo = 1.0 if regimen_actual == "IMPULSO" else 0.5
-                        setup = generar_setup_breakout(mejor_zona_abajo, close, "BAJISTA", score_norm, riesgo)
+                        setup = generar_setup_breakout(mejor_zona_abajo, close, "BAJISTA", score_norm)
                         if setup:
                             prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
-                            prob_line = f"Probabilidad continuación: {prob}%" if prob else "Volumen bajo, probabilidad base 68%"
-                            msg = f"🌋 **SETUP {setup['accion']} (BREAKOUT BAJISTA)** – Score {score_norm}/10\n\n"
-                            msg += f"Entrada sugerida: {fmt(setup['entrada'])}\n"
-                            msg += f"Stop loss: {fmt(setup['stop_loss'])} ({(setup['stop_loss']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Take profit: {fmt(setup['take_profit'])} ({(setup['entrada']-setup['take_profit'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Risk sugerido: {setup['riesgo']}% de capital\n"
+                            prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
+                            msg = f"?? **SETUP {setup['accion']} (BREAKOUT BAJISTA)** – Score {score_norm}/10\n\n"
+                            msg += f"Entrada: {fmt(setup['entrada'])}\n"
+                            msg += f"SL: {fmt(setup['sl'])} ({(setup['sl']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
+                            msg += f"TP: {fmt(setup['tp'])} ({(setup['entrada']-setup['tp'])/setup['entrada']*100:.2f}%)\n"
                             msg += f"Confianza: {setup['confianza']}\n\n"
-                            msg += f"Zona rota: {fmt(mejor_zona_abajo['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
+                            msg += f"Z rota: {fmt(mejor_zona_abajo['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
                             msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
                             msg += f"Bias: {bias}"
                             enviar(msg)
                         last_event_time = ahora
                         return
+
+# =========================
+# RADAR 5 – ESTRUCTURA LENTA (con clustering y cooldown)
+# =========================
+
+def generar_setup_lento(zona, precio_actual, direccion):
+    if zona is None:
+        return None
+    if direccion == "LONG":
+        entrada = round(precio_actual, 1)
+        sl = round(zona["min"] * 0.995, 1)
+        tp = round(zona["max"] * 1.02, 1)   # objetivo amplio
+        accion = "COMPRA (LONG)"
+    else:
+        entrada = round(precio_actual, 1)
+        sl = round(zona["max"] * 1.005, 1)
+        tp = round(zona["min"] * 0.98, 1)
+        accion = "VENTA (SHORT)"
+    return {
+        "accion": accion,
+        "entrada": entrada,
+        "sl": sl,
+        "tp": tp,
+        "confianza": "MEDIA"
+    }
+
+def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
+    global alerted_macro_zones
+
+    if regimen not in ["ACUMULACION", "DISTRIBUCION"]:
+        return
+    if not zonas_macro:
+        return
+
+    # Buscar la zona macro más cercana (en la dirección del régimen)
+    # En acumulación buscamos zonas de soporte (LOW) por debajo del precio
+    # En distribución buscamos zonas de resistencia (HIGH) por encima.
+    zonas_filtradas = []
+    for z in zonas_macro:
+        if regimen == "ACUMULACION" and z["tipo"] == "LOW" and z["centro"] < precio_actual:
+            zonas_filtradas.append(z)
+        elif regimen == "DISTRIBUCION" and z["tipo"] == "HIGH" and z["centro"] > precio_actual:
+            zonas_filtradas.append(z)
+
+    if not zonas_filtradas:
+        return
+
+    # Ordenar por cercanía
+    for z in zonas_filtradas:
+        z["distancia"] = abs(z["centro"] - precio_actual) / precio_actual
+    zonas_filtradas.sort(key=lambda x: x["distancia"])
+
+    zona = zonas_filtradas[0]
+    dist = zona["distancia"]
+
+    if dist >= 0.01:   # 1% de distancia mínima para considerar
+        return
+
+    # Clave para cooldown: centro redondeado + dirección (LONG/SHORT)
+    centro_rd = redondear_centro(zona["centro"])
+    direccion = "LONG" if regimen == "ACUMULACION" else "SHORT"
+    key = (centro_rd, direccion)
+
+    ahora = datetime.now(UTC)
+    ultimo_envio = alerted_macro_zones.get(key)
+    if ultimo_envio and (ahora - ultimo_envio) < timedelta(minutes=MAPA_COOLDOWN_MINUTOS):
+        return   # aún en cooldown
+
+    # Generar setup
+    setup = generar_setup_lento(zona, precio_actual, direccion)
+    if setup:
+        # Mensaje con dirección explícita
+        msg = f"?? **SETUP ESTRUCTURA LENTA ({regimen} - {direccion})**\n\n"
+        msg += f"Entrada: {fmt(setup['entrada'])}\n"
+        msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
+        msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
+        msg += f"Confianza: {setup['confianza']}\n\n"
+        msg += f"Z macro: {fmt(zona['centro'])} (rango {fmt(zona['min'])}-{fmt(zona['max'])}) | Distancia: {dist*100:.2f}%\n"
+        msg += f"P. actual: {fmt(precio_actual)}"
+        enviar(msg)
+
+        alerted_macro_zones[key] = ahora
+
+        # Limpiar entradas antiguas (más de 2 horas)
+        claves_antiguas = [k for k, ts in alerted_macro_zones.items() if (ahora - ts) > timedelta(hours=2)]
+        for k in claves_antiguas:
+            alerted_macro_zones.pop(k, None)
 
 # =========================
 # ALERTAS DE SISTEMA
@@ -962,7 +1079,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.2)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen actual: {regimen_actual}"
+        msg = f"?? BOT DE ARTURO FUNCIONANDO (V13.4)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -974,16 +1091,17 @@ def sin_eventos():
         return
     if (ahora - last_event_time) > timedelta(hours=NO_EVENT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"⚠️ MERCADO SIN EVENTOS RELEVANTES\nTiempo sin señales: {NO_EVENT_HOURS}h\nPrecio: {fmt(precio)} | Hora: {ahora.strftime('%H:%M')}\nEstado: lateral / baja volatilidad"
+        msg = f"?? MERCADO SIN EVENTOS RELEVANTES\nTiempo sin señales: {NO_EVENT_HOURS}h\nPrecio: {fmt(precio)} | Hora: {ahora.strftime('%H:%M')}\nEstado: lateral / baja volatilidad"
         enviar(msg)
         last_event_time = ahora
 
 # =========================
-# EVALUACIÓN DE RESULTADOS
+# EVALUACIÓN DE RESULTADOS (2v, 6v, 12v)
 # =========================
 
 def evaluar_eventos_pendientes(precio_actual):
     for evento in list(historial_eventos):
+        # Scalping (2 velas, 0.3%)
         if not evento.get("evaluado_scalp", False):
             ts_evento = datetime.fromisoformat(evento["timestamp"])
             if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS_SCALP * 5):
@@ -1005,28 +1123,51 @@ def evaluar_eventos_pendientes(precio_actual):
                         evento["resultado_scalp"] = "NEUTRO"
                 evento["evaluado_scalp"] = True
 
-        if not evento.get("evaluado_tendencia", False):
+        # Tendencia (6 velas, 0.5%)
+        if not evento.get("evaluado_tend", False):
             ts_evento = datetime.fromisoformat(evento["timestamp"])
             if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS_TEND * 5):
                 precio_inicial = evento["precio"]
                 direccion = evento["direccion"]
                 if direccion == "ALCISTA":
                     if precio_actual >= precio_inicial * (1 + RANGO_EXITO_TEND):
-                        evento["resultado_tendencia"] = "EXITO"
+                        evento["resultado_tend"] = "EXITO"
                     elif precio_actual <= precio_inicial * (1 - RANGO_EXITO_TEND):
-                        evento["resultado_tendencia"] = "FRACASO"
+                        evento["resultado_tend"] = "FRACASO"
                     else:
-                        evento["resultado_tendencia"] = "NEUTRO"
+                        evento["resultado_tend"] = "NEUTRO"
                 else:
                     if precio_actual <= precio_inicial * (1 - RANGO_EXITO_TEND):
-                        evento["resultado_tendencia"] = "EXITO"
+                        evento["resultado_tend"] = "EXITO"
                     elif precio_actual >= precio_inicial * (1 + RANGO_EXITO_TEND):
-                        evento["resultado_tendencia"] = "FRACASO"
+                        evento["resultado_tend"] = "FRACASO"
                     else:
-                        evento["resultado_tendencia"] = "NEUTRO"
-                evento["evaluado_tendencia"] = True
+                        evento["resultado_tend"] = "NEUTRO"
+                evento["evaluado_tend"] = True
 
-        if evento.get("evaluado_scalp", False) and evento.get("evaluado_tendencia", False):
+        # Largo plazo (12 velas, 1.0%) – opcional
+        if not evento.get("evaluado_largo", False):
+            ts_evento = datetime.fromisoformat(evento["timestamp"])
+            if (datetime.now(UTC) - ts_evento) > timedelta(minutes=EVALUACION_VELAS_LARGA * 5):
+                precio_inicial = evento["precio"]
+                direccion = evento["direccion"]
+                if direccion == "ALCISTA":
+                    if precio_actual >= precio_inicial * (1 + RANGO_EXITO_LARGA):
+                        evento["resultado_largo"] = "EXITO"
+                    elif precio_actual <= precio_inicial * (1 - RANGO_EXITO_LARGA):
+                        evento["resultado_largo"] = "FRACASO"
+                    else:
+                        evento["resultado_largo"] = "NEUTRO"
+                else:
+                    if precio_actual <= precio_inicial * (1 - RANGO_EXITO_LARGA):
+                        evento["resultado_largo"] = "EXITO"
+                    elif precio_actual >= precio_inicial * (1 + RANGO_EXITO_LARGA):
+                        evento["resultado_largo"] = "FRACASO"
+                    else:
+                        evento["resultado_largo"] = "NEUTRO"
+                evento["evaluado_largo"] = True
+
+        if evento.get("evaluado_scalp", False) and evento.get("evaluado_tend", False) and evento.get("evaluado_largo", False):
             evento["evaluado"] = True
 
 def generar_informe_resultados_como_texto():
@@ -1034,12 +1175,17 @@ def generar_informe_resultados_como_texto():
         return None
     df = pd.DataFrame(list(historial_eventos))
     df_scalp = df[df["evaluado_scalp"] == True]
-    df_tend = df[df["evaluado_tendencia"] == True]
-    if df_scalp.empty and df_tend.empty:
+    df_tend = df[df["evaluado_tend"] == True]
+    df_largo = df[df["evaluado_largo"] == True]
+
+    if df_scalp.empty and df_tend.empty and df_largo.empty:
         return None
-    informe = "📊 **INFORME DE RESULTADOS (V13.2)**\n\n"
+
+    informe = "?? **INFORME DE RESULTADOS (V13.4)**\n\n"
     for tipo in df["tipo"].unique():
-        informe += f"🔹 {tipo.upper()}\n"
+        informe += f"?? {tipo.upper()}\n"
+
+        # Scalping (2v)
         subset = df_scalp[df_scalp["tipo"] == tipo]
         if not subset.empty:
             total = len(subset)
@@ -1047,7 +1193,8 @@ def generar_informe_resultados_como_texto():
             fracasos = len(subset[subset["resultado_scalp"] == "FRACASO"])
             neutros = len(subset[subset["resultado_scalp"] == "NEUTRO"])
             tasa = exitos / total * 100 if total else 0
-            informe += f"   ⏱️ Scalping (3v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+            informe += f"   ?? Scalping (2v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+            # Desglose por volumen
             if "volumen" in subset.columns:
                 vol_bajo = subset[subset["volumen"] < 300]
                 vol_medio = subset[(subset["volumen"] >= 300) & (subset["volumen"] <= 600)]
@@ -1055,23 +1202,41 @@ def generar_informe_resultados_como_texto():
                 if not vol_bajo.empty:
                     ex = len(vol_bajo[vol_bajo["resultado_scalp"] == "EXITO"])
                     to = len(vol_bajo)
-                    informe += f"      📊 Vol <300: {to} ops, éxito {ex/to*100:.1f}%\n"
+                    informe += f"      ?? Vol <300: {to} ops, éxito {ex/to*100:.1f}%\n"
                 if not vol_medio.empty:
                     ex = len(vol_medio[vol_medio["resultado_scalp"] == "EXITO"])
                     to = len(vol_medio)
-                    informe += f"      📊 Vol 300-600: {to} ops, éxito {ex/to*100:.1f}%\n"
+                    informe += f"      ?? Vol 300-600: {to} ops, éxito {ex/to*100:.1f}%\n"
                 if not vol_alto.empty:
                     ex = len(vol_alto[vol_alto["resultado_scalp"] == "EXITO"])
                     to = len(vol_alto)
-                    informe += f"      📊 Vol >600: {to} ops, éxito {ex/to*100:.1f}%\n"
+                    informe += f"      ?? Vol >600: {to} ops, éxito {ex/to*100:.1f}%\n"
+            # Score promedio
+            if "score_norm" in subset.columns:
+                score_exito = subset[subset["resultado_scalp"] == "EXITO"]["score_norm"].mean()
+                score_fracaso = subset[subset["resultado_scalp"] == "FRACASO"]["score_norm"].mean() if len(subset[subset["resultado_scalp"] == "FRACASO"]) > 0 else 0
+                informe += f"      ?? Score promedio: éxito {score_exito:.1f} / fracaso {score_fracaso:.1f}\n"
+
+        # Tendencia (6v)
         subset = df_tend[df_tend["tipo"] == tipo]
         if not subset.empty:
             total = len(subset)
-            exitos = len(subset[subset["resultado_tendencia"] == "EXITO"])
-            fracasos = len(subset[subset["resultado_tendencia"] == "FRACASO"])
-            neutros = len(subset[subset["resultado_tendencia"] == "NEUTRO"])
+            exitos = len(subset[subset["resultado_tend"] == "EXITO"])
+            fracasos = len(subset[subset["resultado_tend"] == "FRACASO"])
+            neutros = len(subset[subset["resultado_tend"] == "NEUTRO"])
             tasa = exitos / total * 100 if total else 0
-            informe += f"   📈 Tendencia (12v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+            informe += f"   ?? Tendencia (6v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+
+        # Largo plazo (12v)
+        subset = df_largo[df_largo["tipo"] == tipo]
+        if not subset.empty:
+            total = len(subset)
+            exitos = len(subset[subset["resultado_largo"] == "EXITO"])
+            fracasos = len(subset[subset["resultado_largo"] == "FRACASO"])
+            neutros = len(subset[subset["resultado_largo"] == "NEUTRO"])
+            tasa = exitos / total * 100 if total else 0
+            informe += f"   ?? Largo plazo (12v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
+
         informe += "\n"
     return informe
 
@@ -1113,13 +1278,14 @@ def procesar_comando(texto, chat_id):
 # =========================
 
 def evaluar():
-    global zona_actual, zona_consumida, alerted_liquidity, alerted_proximidad, last_event_time, last_mapa_time, regimen_actual
+    global zona_actual, zona_consumida, alerted_liquidity, alerted_proximidad, last_event_time, last_mapa_time, regimen_actual, zonas_macro
 
     ahora = datetime.now(UTC)
     hora_str = ahora.strftime('%H:%M')
 
-    df_1h = obtener_candles_spot(INTERVAL_MACRO)
-    df_4h = obtener_candles_spot(INTERVAL_BIAS)
+    # Obtener datos
+    df_1h = obtener_candles_spot(INTERVAL_MACRO, limit=400)   # para tener al menos 336 velas
+    df_4h = obtener_candles_spot(INTERVAL_BIAS, limit=100)
     df_entry = obtener_candles_spot(INTERVAL_ENTRY)
     df_oi = obtener_open_interest_hist(period="5m", limit=200)
     precio = obtener_precio_actual()
@@ -1131,10 +1297,11 @@ def evaluar():
 
     bias = calcular_bias(df_1h, df_4h, precio)
 
-    # Detectar zonas
+    # Detectar zonas spot (para radares 0,3,4)
     zonas_high_spot, zonas_low_spot = detectar_zonas_spot(df_1h) if not df_1h.empty else ([], [])
     mejor_spot_arriba, mejor_spot_abajo = seleccionar_mejores_zonas_spot(zonas_high_spot, zonas_low_spot, precio)
 
+    # Detectar zonas OI
     clusters_oi = detectar_zonas_oi(df_oi, df_1h) if not df_oi.empty else []
     mejor_oi_arriba = None
     mejor_oi_abajo = None
@@ -1148,28 +1315,38 @@ def evaluar():
             abajo_oi.sort(key=lambda x: x["oi_total"], reverse=True)
             mejor_oi_abajo = abajo_oi[0]
 
+    # Actualizar zonas internas (Radar 1 y 2)
     actualizar_zonas_internas(mejor_oi_arriba, mejor_oi_abajo, mejor_spot_arriba, mejor_spot_abajo, precio, hora_str, bias)
 
     zona_ref_arriba = mejor_oi_arriba if mejor_oi_arriba else mejor_spot_arriba
     zona_ref_abajo = mejor_oi_abajo if mejor_oi_abajo else mejor_spot_abajo
     radar_proximidad_interno(zona_ref_arriba, zona_ref_abajo, precio, hora_str, bias)
 
+    # Zonas para radares de eventos
     zonas_arriba = [z for z in ([mejor_oi_arriba] if mejor_oi_arriba else []) + ([mejor_spot_arriba] if mejor_spot_arriba else []) if z]
     zonas_abajo = [z for z in ([mejor_oi_abajo] if mejor_oi_abajo else []) + ([mejor_spot_abajo] if mejor_spot_abajo else []) if z]
 
+    # Radar 0 (impulso)
     hubo_impulso = radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias)
 
+    # Obtener resultado del último impulso para transición de régimen
     resultado_impulso = None
     if hubo_impulso and historial_eventos:
         ultimo_impulso = next((e for e in reversed(historial_eventos) if e["tipo"] == "impulso" and e.get("evaluado_scalp")), None)
         if ultimo_impulso:
             resultado_impulso = ultimo_impulso.get("resultado_scalp")
 
+    # Actualizar régimen y zonas macro (en 1h con 2 semanas)
     actualizar_regimen(df_1h, hubo_impulso, resultado_impulso)
 
+    # Radar 5 (estructura lenta)
+    radar_estructura_lenta(precio, zonas_macro, regimen_actual)
+
+    # Radar 3 y 4 (sweep, breakout)
     radar_sweep(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
     radar_breakout(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
 
+    # Limpieza de alerted_proximidad
     keys_a_remover = []
     for key, ts in alerted_proximidad.items():
         if (ahora - ts) > timedelta(hours=2):
@@ -1177,6 +1354,7 @@ def evaluar():
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
 
+    # Sistema
     heartbeat()
     sin_eventos()
 
@@ -1185,16 +1363,17 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V13.2 (variación ≥0.65% siempre alerta)...")
+    print("?? Iniciando BOT V13.4 (volumen como filtro principal, texto simplificado, macro con cooldown)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.2)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"?? BOT DE ARTURO FUNCIONANDO (V13.4)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)
     last_event_time = datetime.now(UTC)
     last_mapa_time = None
 
+    # Cargar historial
     if os.path.exists(HISTORIAL_FILE):
         try:
             with open(HISTORIAL_FILE, "r") as f:
@@ -1203,6 +1382,7 @@ if __name__ == "__main__":
         except:
             pass
 
+    # Hilo para comandos
     def escuchar_mensajes():
         while True:
             obtener_mensajes()
@@ -1213,11 +1393,12 @@ if __name__ == "__main__":
         try:
             evaluar()
         except Exception as e:
-            print(f"❌ Error en ciclo principal: {e}")
-            enviar(f"⚠️ ERROR: {str(e)[:100]}")
+            print(f"? Error en ciclo principal: {e}")
+            enviar(f"?? ERROR: {str(e)[:100]}")
             time.sleep(60)
         time.sleep(60)
 
+        # Guardar historial cada hora
         if datetime.now(UTC).minute == 0:
             try:
                 with open(HISTORIAL_FILE, "w") as f:

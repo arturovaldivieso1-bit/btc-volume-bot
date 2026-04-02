@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, UTC
 from collections import deque
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # CONFIGURACIÓN INICIAL
@@ -143,7 +144,7 @@ last_event_time = None
 last_mapa_time = None
 zona_actual = None
 zona_consumida = False
-alerted_liquidity = set()
+alerted_liquidity_ts = {}      # ahora es dict con timestamp
 alerted_proximidad = {}
 sweep_pendiente = None
 ultima_zona_arriba = None
@@ -172,6 +173,11 @@ ZONA_MACRO_COOLDOWN_HORAS = 2      # no repetir para la misma zona en 2h
 ALERTA_DERIVA_HORAS = 2
 ALERTA_DERIVA_PORCENTAJE = 0.5
 
+# Locks para acceso a datos compartidos entre hilos
+data_lock = threading.Lock()
+ultimo_guardado = datetime.now(UTC)
+ultima_limpieza_liquidity = datetime.now(UTC)
+
 # =========================
 # FUNCIONES AUXILIARES
 # =========================
@@ -199,7 +205,7 @@ def obtener_candles_spot(interval, limit=200):
             df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        print(f"Error Binance spot: {e}")
+        print(f"Error Binance spot {interval}: {e}")
         return pd.DataFrame()
 
 def obtener_precio_actual():
@@ -209,6 +215,45 @@ def obtener_precio_actual():
         return float(r.json()["price"])
     except:
         return None
+
+def obtener_open_interest_hist(period="5m", limit=200):
+    url = "https://fapi.binance.com/futures/data/openInterestHist"
+    params = {"symbol": SYMBOL, "period": period, "limit": limit}
+    try:
+        data = requests.get(url, params=params, timeout=10).json()
+        df = pd.DataFrame(data)
+        df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"])
+        df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+        return df
+    except Exception as e:
+        print(f"Error OI: {e}")
+        return pd.DataFrame()
+
+# =========================
+# FUNCIONES DE OBTENCIÓN PARALELA
+# =========================
+
+def obtener_todos_los_datos():
+    """Ejecuta todas las llamadas a Binance en paralelo usando ThreadPoolExecutor."""
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_1h = executor.submit(obtener_candles_spot, INTERVAL_MACRO, 400)
+        future_4h = executor.submit(obtener_candles_spot, INTERVAL_BIAS, 100)
+        future_5m = executor.submit(obtener_candles_spot, INTERVAL_ENTRY)
+        future_oi = executor.submit(obtener_open_interest_hist, "5m", 200)
+        future_precio = executor.submit(obtener_precio_actual)
+
+        df_1h = future_1h.result()
+        df_4h = future_4h.result()
+        df_entry = future_5m.result()
+        df_oi = future_oi.result()
+        precio = future_precio.result()
+
+    return df_1h, df_4h, df_entry, df_oi, precio
+
+# =========================
+# FUNCIONES DE CLUSTERING Y ZONAS
+# =========================
 
 def cluster_precios(lista, rango=CLUSTER_RANGE):
     clusters = []
@@ -380,6 +425,11 @@ def detectar_estructura_y_zonas(df_1h):
     extrae zonas macro de soporte/resistencia usando 336 velas (2 semanas).
     """
     if df_1h.empty or len(df_1h) < 336:
+        # Advertencia silenciosa solo una vez
+        if not hasattr(detectar_estructura_y_zonas, "warning_sent"):
+            print("⚠️ Menos de 336 velas en df_1h, régimen NEUTRAL temporal")
+            enviar("⚠️ Advertencia: Datos insuficientes para detectar régimen (menos de 336 velas 1h). Régimen = NEUTRAL.")
+            detectar_estructura_y_zonas.warning_sent = True
         return "NEUTRAL", []
 
     # 1. Detectar régimen por pivotes (últimas 336 velas)
@@ -436,20 +486,6 @@ def actualizar_regimen(df_1h, hubo_impulso, resultado_impulso=None):
 # =========================
 # OPEN INTEREST
 # =========================
-
-def obtener_open_interest_hist(period="5m", limit=200):
-    url = "https://fapi.binance.com/futures/data/openInterestHist"
-    params = {"symbol": SYMBOL, "period": period, "limit": limit}
-    try:
-        data = requests.get(url, params=params, timeout=10).json()
-        df = pd.DataFrame(data)
-        df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"])
-        df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-        return df
-    except Exception as e:
-        print(f"Error OI: {e}")
-        return pd.DataFrame()
 
 def cluster_oi_por_precio(eventos_oi):
     clusters = []
@@ -559,7 +595,7 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
         check_and_record(mejor_zona_abajo, "LOW")
 
 # =========================
-# RADAR 0 – IMPULSO (NO MODIFICADO, solo se ajustó la bonificación de volumen llamada internamente)
+# RADAR 0 – IMPULSO (NO MODIFICADO)
 # =========================
 
 def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
@@ -585,7 +621,7 @@ def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
     }
 
 def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
-    global last_impulse_time, last_event_time, historial_eventos, regimen_actual
+    global last_impulse_time, last_event_time, regimen_actual
     if df_entry.empty or len(df_entry) < 3:
         return False
 
@@ -645,7 +681,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     if not prob_lines:
         prob_lines.append(f"  Volumen insuficiente: prob base 68%")
 
-    # Registrar evento
+    # Registrar evento (con lock)
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "impulso",
@@ -664,7 +700,8 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         "evaluado_largo": False,
         "evaluado": False
     }
-    historial_eventos.append(evento)
+    with data_lock:
+        historial_eventos.append(evento)
 
     # Calcular score y setup (solo si hay zona)
     score_norm = 0
@@ -734,7 +771,7 @@ def generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm):
     }
 
 def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
-    global sweep_pendiente, last_event_time, historial_eventos, regimen_actual
+    global sweep_pendiente, last_event_time, regimen_actual
     if df_entry.empty or len(df_entry) < 2:
         return
     vela_actual = df_entry.iloc[-1]
@@ -769,9 +806,8 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
         score_abs = calcular_score_evento("sweep", direccion_rev, bias, peso_zona, validacion_spot, vol_sweep)
         score_norm = normalizar_score(score_abs)
 
-        # Registrar evento (para estadísticas)
+        # Registrar evento (con lock)
         ahora = datetime.now(UTC)
-        color_zona = "🟢" if tipo_sweep == "HIGH" else "🔴"
         evento = {
             "timestamp": ahora.isoformat(),
             "tipo": "sweep",
@@ -789,7 +825,8 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             "evaluado_largo": False,
             "evaluado": False
         }
-        historial_eventos.append(evento)
+        with data_lock:
+            historial_eventos.append(evento)
 
         # Solo generar setup si volumen >400 o score ≥7
         if vol_sweep > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_SWEEP:
@@ -804,9 +841,6 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                 msg += f"Volumen: {vol_sweep:.0f} BTC\n{prob_line}\n"
                 msg += f"Bias: {bias}"
                 enviar(msg)
-        else:
-            # No enviar alerta para sweeps de bajo volumen/score bajo (silencio)
-            pass
 
         last_event_time = ahora
         sweep_pendiente = None
@@ -840,7 +874,7 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
                 break
 
 # =========================
-# RADAR 4 (BREAKOUT) – misma lógica de filtro
+# RADAR 4 (BREAKOUT) – misma lógica de filtro, corregido mensaje SL bajista
 # =========================
 
 def generar_setup_breakout(zona, precio_actual, direccion, score_norm):
@@ -866,7 +900,7 @@ def generar_setup_breakout(zona, precio_actual, direccion, score_norm):
     }
 
 def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zonas_arriba, zonas_abajo, bias):
-    global zona_consumida, last_event_time, alerted_liquidity, historial_eventos, regimen_actual
+    global zona_consumida, last_event_time, regimen_actual
     if df_entry.empty or len(df_entry) < BREAKOUT_RETEST_CANDLES + 1:
         return
     vela = df_entry.iloc[-1]
@@ -887,112 +921,119 @@ def radar_breakout(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual,
 
     if mejor_zona_arriba:
         key = ("break", redondear_centro(mejor_zona_arriba["centro"]))
-        if key not in alerted_liquidity and close > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) * (1 + BREAKOUT_MARGIN):
-            if hubo_retest(mejor_zona_arriba, "ALCISTA"):
-                peso_zona = calcular_peso_zona(mejor_zona_arriba if 'toques' in mejor_zona_arriba else None,
-                                                mejor_zona_arriba if 'oi_total' in mejor_zona_arriba else None, precio_actual)
-                if peso_zona >= BREAKOUT_PESO_MINIMO:
-                    validacion_spot = False
-                    if 'oi_total' in mejor_zona_arriba:
-                        for z in (zonas_arriba + zonas_abajo):
-                            if 'toques' in z and abs(mejor_zona_arriba['centro'] - z['centro']) / mejor_zona_arriba['centro'] < SPOT_FUTUROS_TOLERANCIA:
-                                validacion_spot = True
-                                break
-                    score_abs = calcular_score_evento("breakout", "ALCISTA", bias, peso_zona, validacion_spot, vol_break)
-                    score_norm = normalizar_score(score_abs)
-                    if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_SWEEP:
-                        alerted_liquidity.add(key)
-                        zona_consumida = True
-                        evento = {
-                            "timestamp": ahora.isoformat(),
-                            "tipo": "breakout",
-                            "direccion": "ALCISTA",
-                            "precio": close,
-                            "score_abs": score_abs,
-                            "score_norm": score_norm,
-                            "volumen": vol_break,
-                            "zona_centro": mejor_zona_arriba['centro'],
-                            "resultado_scalp": None,
-                            "resultado_tend": None,
-                            "resultado_largo": None,
-                            "evaluado_scalp": False,
-                            "evaluado_tend": False,
-                            "evaluado_largo": False,
-                            "evaluado": False
-                        }
-                        historial_eventos.append(evento)
-                        registrar_evento_para_patron("breakout", "ALCISTA")
-                        setup = generar_setup_breakout(mejor_zona_arriba, close, "ALCISTA", score_norm)
-                        if setup:
-                            prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
-                            prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
-                            msg = f"🌋 **BREAKOUT ALCISTA (SETUP)** – Score {score_norm}/10\n\n"
-                            msg += f"Entrada: {fmt(setup['entrada'])}\n"
-                            msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Confianza: {setup['confianza']}\n\n"
-                            msg += f"Z rota: {fmt(mejor_zona_arriba['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
-                            msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
-                            msg += f"Bias: {bias}"
-                            enviar(msg)
-                        last_event_time = ahora
-                        return
+        with data_lock:
+            if key not in alerted_liquidity_ts and close > mejor_zona_arriba.get("max", mejor_zona_arriba["centro"]*1.01) * (1 + BREAKOUT_MARGIN):
+                if hubo_retest(mejor_zona_arriba, "ALCISTA"):
+                    peso_zona = calcular_peso_zona(mejor_zona_arriba if 'toques' in mejor_zona_arriba else None,
+                                                    mejor_zona_arriba if 'oi_total' in mejor_zona_arriba else None, precio_actual)
+                    if peso_zona >= BREAKOUT_PESO_MINIMO:
+                        validacion_spot = False
+                        if 'oi_total' in mejor_zona_arriba:
+                            for z in (zonas_arriba + zonas_abajo):
+                                if 'toques' in z and abs(mejor_zona_arriba['centro'] - z['centro']) / mejor_zona_arriba['centro'] < SPOT_FUTUROS_TOLERANCIA:
+                                    validacion_spot = True
+                                    break
+                        score_abs = calcular_score_evento("breakout", "ALCISTA", bias, peso_zona, validacion_spot, vol_break)
+                        score_norm = normalizar_score(score_abs)
+                        if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_SWEEP:
+                            alerted_liquidity_ts[key] = ahora.timestamp()
+                            zona_consumida = True
+                            evento = {
+                                "timestamp": ahora.isoformat(),
+                                "tipo": "breakout",
+                                "direccion": "ALCISTA",
+                                "precio": close,
+                                "score_abs": score_abs,
+                                "score_norm": score_norm,
+                                "volumen": vol_break,
+                                "zona_centro": mejor_zona_arriba['centro'],
+                                "resultado_scalp": None,
+                                "resultado_tend": None,
+                                "resultado_largo": None,
+                                "evaluado_scalp": False,
+                                "evaluado_tend": False,
+                                "evaluado_largo": False,
+                                "evaluado": False
+                            }
+                            with data_lock:
+                                historial_eventos.append(evento)
+                            registrar_evento_para_patron("breakout", "ALCISTA")
+                            setup = generar_setup_breakout(mejor_zona_arriba, close, "ALCISTA", score_norm)
+                            if setup:
+                                prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
+                                prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
+                                msg = f"🌋 **BREAKOUT ALCISTA (SETUP)** – Score {score_norm}/10\n\n"
+                                msg += f"Entrada: {fmt(setup['entrada'])}\n"
+                                msg += f"SL: {fmt(setup['sl'])} ({(setup['entrada']-setup['sl'])/setup['entrada']*100:.2f}%)\n"
+                                msg += f"TP: {fmt(setup['tp'])} ({(setup['tp']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
+                                msg += f"Confianza: {setup['confianza']}\n\n"
+                                msg += f"Z rota: {fmt(mejor_zona_arriba['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
+                                msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
+                                msg += f"Bias: {bias}"
+                                enviar(msg)
+                            last_event_time = ahora
+                            return
 
     if mejor_zona_abajo:
         key = ("break", redondear_centro(mejor_zona_abajo["centro"]))
-        if key not in alerted_liquidity and close < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) * (1 - BREAKOUT_MARGIN):
-            if hubo_retest(mejor_zona_abajo, "BAJISTA"):
-                peso_zona = calcular_peso_zona(mejor_zona_abajo if 'toques' in mejor_zona_abajo else None,
-                                                mejor_zona_abajo if 'oi_total' in mejor_zona_abajo else None, precio_actual)
-                if peso_zona >= BREAKOUT_PESO_MINIMO:
-                    validacion_spot = False
-                    if 'oi_total' in mejor_zona_abajo:
-                        for z in (zonas_arriba + zonas_abajo):
-                            if 'toques' in z and abs(mejor_zona_abajo['centro'] - z['centro']) / mejor_zona_abajo['centro'] < SPOT_FUTUROS_TOLERANCIA:
-                                validacion_spot = True
-                                break
-                    score_abs = calcular_score_evento("breakout", "BAJISTA", bias, peso_zona, validacion_spot, vol_break)
-                    score_norm = normalizar_score(score_abs)
-                    if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_SWEEP:
-                        alerted_liquidity.add(key)
-                        zona_consumida = True
-                        evento = {
-                            "timestamp": ahora.isoformat(),
-                            "tipo": "breakout",
-                            "direccion": "BAJISTA",
-                            "precio": close,
-                            "score_abs": score_abs,
-                            "score_norm": score_norm,
-                            "volumen": vol_break,
-                            "zona_centro": mejor_zona_abajo['centro'],
-                            "resultado_scalp": None,
-                            "resultado_tend": None,
-                            "resultado_largo": None,
-                            "evaluado_scalp": False,
-                            "evaluado_tend": False,
-                            "evaluado_largo": False,
-                            "evaluado": False
-                        }
-                        historial_eventos.append(evento)
-                        registrar_evento_para_patron("breakout", "BAJISTA")
-                        setup = generar_setup_breakout(mejor_zona_abajo, close, "BAJISTA", score_norm)
-                        if setup:
-                            prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
-                            prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
-                            msg = f"🌋 **BREAKOUT BAJISTA (SETUP)** – Score {score_norm}/10\n\n"
-                            msg += f"Entrada: {fmt(setup['entrada'])}\n"
-                            msg += f"SL: {fmt(setup['sl'])} ({(setup['sl']-setup['entrada'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"TP: {fmt(setup['tp'])} ({(setup['entrada']-setup['tp'])/setup['entrada']*100:.2f}%)\n"
-                            msg += f"Confianza: {setup['confianza']}\n\n"
-                            msg += f"Z rota: {fmt(mejor_zona_abajo['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
-                            msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
-                            msg += f"Bias: {bias}"
-                            enviar(msg)
-                        last_event_time = ahora
-                        return
+        with data_lock:
+            if key not in alerted_liquidity_ts and close < mejor_zona_abajo.get("min", mejor_zona_abajo["centro"]*0.99) * (1 - BREAKOUT_MARGIN):
+                if hubo_retest(mejor_zona_abajo, "BAJISTA"):
+                    peso_zona = calcular_peso_zona(mejor_zona_abajo if 'toques' in mejor_zona_abajo else None,
+                                                    mejor_zona_abajo if 'oi_total' in mejor_zona_abajo else None, precio_actual)
+                    if peso_zona >= BREAKOUT_PESO_MINIMO:
+                        validacion_spot = False
+                        if 'oi_total' in mejor_zona_abajo:
+                            for z in (zonas_arriba + zonas_abajo):
+                                if 'toques' in z and abs(mejor_zona_abajo['centro'] - z['centro']) / mejor_zona_abajo['centro'] < SPOT_FUTUROS_TOLERANCIA:
+                                    validacion_spot = True
+                                    break
+                        score_abs = calcular_score_evento("breakout", "BAJISTA", bias, peso_zona, validacion_spot, vol_break)
+                        score_norm = normalizar_score(score_abs)
+                        if vol_break > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_SWEEP:
+                            alerted_liquidity_ts[key] = ahora.timestamp()
+                            zona_consumida = True
+                            evento = {
+                                "timestamp": ahora.isoformat(),
+                                "tipo": "breakout",
+                                "direccion": "BAJISTA",
+                                "precio": close,
+                                "score_abs": score_abs,
+                                "score_norm": score_norm,
+                                "volumen": vol_break,
+                                "zona_centro": mejor_zona_abajo['centro'],
+                                "resultado_scalp": None,
+                                "resultado_tend": None,
+                                "resultado_largo": None,
+                                "evaluado_scalp": False,
+                                "evaluado_tend": False,
+                                "evaluado_largo": False,
+                                "evaluado": False
+                            }
+                            with data_lock:
+                                historial_eventos.append(evento)
+                            registrar_evento_para_patron("breakout", "BAJISTA")
+                            setup = generar_setup_breakout(mejor_zona_abajo, close, "BAJISTA", score_norm)
+                            if setup:
+                                prob = obtener_probabilidad(vol_break, [VOL1_MED, VOL1_P75, VOL1_P90], [PROB1_MED, PROB1_P75, PROB1_P90])
+                                prob_line = f"Probabilidad: {prob}%" if prob else "Probabilidad base 68%"
+                                # CORRECCIÓN: usar misma fórmula que en alcista (entrada - sl) / entrada
+                                sl_porcentaje = (setup['entrada'] - setup['sl']) / setup['entrada'] * 100
+                                tp_porcentaje = (setup['entrada'] - setup['tp']) / setup['entrada'] * 100
+                                msg = f"🌋 **BREAKOUT BAJISTA (SETUP)** – Score {score_norm}/10\n\n"
+                                msg += f"Entrada: {fmt(setup['entrada'])}\n"
+                                msg += f"SL: {fmt(setup['sl'])} ({sl_porcentaje:.2f}%)\n"
+                                msg += f"TP: {fmt(setup['tp'])} ({tp_porcentaje:.2f}%)\n"
+                                msg += f"Confianza: {setup['confianza']}\n\n"
+                                msg += f"Z rota: {fmt(mejor_zona_abajo['centro'])} | Precio: {fmt(close)} | Hora: {ahora.strftime('%H:%M')}\n"
+                                msg += f"Volumen: {vol_break:.0f} BTC\n{prob_line}\n"
+                                msg += f"Bias: {bias}"
+                                enviar(msg)
+                            last_event_time = ahora
+                            return
 
 # =========================
-# RADAR 5 – ESTRUCTURA LENTA (con registro en historial y emojis)
+# RADAR 5 – ESTRUCTURA LENTA (con registro en historial)
 # =========================
 
 def generar_setup_lento(zona, precio_actual, direccion):
@@ -1001,7 +1042,7 @@ def generar_setup_lento(zona, precio_actual, direccion):
     if direccion == "LONG":
         entrada = round(precio_actual, 1)
         sl = round(zona["min"] * 0.995, 1)
-        tp = round(zona["max"] * 1.02, 1)   # objetivo amplio
+        tp = round(zona["max"] * 1.02, 1)
         accion = "COMPRA (LONG)"
     else:
         entrada = round(precio_actual, 1)
@@ -1017,7 +1058,7 @@ def generar_setup_lento(zona, precio_actual, direccion):
     }
 
 def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
-    global last_event_time, alerted_macro, historial_eventos
+    global last_event_time, alerted_macro
     if regimen not in ["ACUMULACION", "DISTRIBUCION"]:
         return
     if not zonas_macro:
@@ -1037,21 +1078,21 @@ def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
     zona, dist = zonas_cercanas[0]
     direccion = "LONG" if regimen == "ACUMULACION" else "SHORT"
 
-    # Cooldown por zona (redondeada a 200)
+    # Cooldown por zona
     key = (redondear_centro(zona["centro"], 200), direccion)
     ultimo = alerted_macro.get(key)
     if ultimo and (ahora - ultimo) < timedelta(hours=ZONA_MACRO_COOLDOWN_HORAS):
         return
     alerted_macro[key] = ahora
 
-    # Registrar evento en historial (para estadísticas)
+    # Registrar evento en historial (con lock)
     evento = {
         "timestamp": ahora.isoformat(),
         "tipo": "estructura_lenta",
         "direccion": direccion,
         "precio": precio_actual,
         "score_abs": 0,
-        "score_norm": 5,   # confianza media
+        "score_norm": 5,
         "volumen": 0,
         "zona_centro": zona['centro'],
         "resultado_scalp": None,
@@ -1062,7 +1103,8 @@ def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
         "evaluado_largo": False,
         "evaluado": False
     }
-    historial_eventos.append(evento)
+    with data_lock:
+        historial_eventos.append(evento)
 
     # Construir mensaje con simbología
     titulo = f"🐢 **ALERTA ESTRUCTURA LENTA ({regimen} - {direccion})**"
@@ -1070,7 +1112,6 @@ def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
     msg += f"🧲 Z macro: {fmt(zona['centro'])} (rango {fmt(zona['min'])}-{fmt(zona['max'])}) | Distancia: {dist*100:.2f}%\n"
     msg += f"P. actual: {fmt(precio_actual)}\n"
 
-    # Setup solo si está muy cerca
     if dist < ZONA_MACRO_SETUP_DIST:
         setup = generar_setup_lento(zona, precio_actual, direccion)
         if setup:
@@ -1097,7 +1138,7 @@ def heartbeat():
         return
     if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
         precio = obtener_precio_actual() or 0
-        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.6)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}"
+        msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.7)\nHora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}"
         enviar(msg)
         last_heartbeat_time = ahora
 
@@ -1113,7 +1154,6 @@ def sin_eventos():
         enviar(msg)
         last_event_time = ahora
 
-# DERIVA SILENCIOSA – NO MODIFICADA (sin emojis adicionales, como estaba originalmente)
 def alerta_deriva_silenciosa(precio_actual, ahora):
     global ultima_deriva_time, ultimo_precio_deriva, last_event_time
     if ultima_deriva_time is None:
@@ -1129,16 +1169,18 @@ def alerta_deriva_silenciosa(precio_actual, ahora):
             msg += f"Dirección: {direccion} ({regimen_actual})"
             enviar(msg)
             last_event_time = ahora
-        # Reiniciar contador
         ultima_deriva_time = ahora
         ultimo_precio_deriva = precio_actual
 
 # =========================
-# EVALUACIÓN DE RESULTADOS (con reducción de neutros)
+# EVALUACIÓN DE RESULTADOS (con reducción de neutros y lock)
 # =========================
 
 def evaluar_eventos_pendientes(precio_actual):
-    for evento in list(historial_eventos):
+    with data_lock:
+        eventos_copia = list(historial_eventos)  # copia de referencias
+
+    for evento in eventos_copia:
         # Scalping (2v, 0.3%)
         if not evento.get("evaluado_scalp", False):
             ts_evento = datetime.fromisoformat(evento["timestamp"])
@@ -1151,12 +1193,11 @@ def evaluar_eventos_pendientes(precio_actual):
                     elif precio_actual <= precio_inicial * (1 - RANGO_EXITO_SCALP):
                         evento["resultado_scalp"] = "FRACASO"
                     else:
-                        # Si no llegó a ningún umbral, considerar fracaso a menos que esté casi plano
                         if abs(precio_actual - precio_inicial) / precio_inicial < 0.001:
                             evento["resultado_scalp"] = "NEUTRO"
                         else:
                             evento["resultado_scalp"] = "FRACASO"
-                else:  # BAJISTA
+                else:
                     if precio_actual <= precio_inicial * (1 - RANGO_EXITO_SCALP):
                         evento["resultado_scalp"] = "EXITO"
                     elif precio_actual >= precio_inicial * (1 + RANGO_EXITO_SCALP):
@@ -1228,9 +1269,10 @@ def evaluar_eventos_pendientes(precio_actual):
             evento["evaluado"] = True
 
 def generar_informe_resultados_como_texto():
-    if not historial_eventos:
-        return None
-    df = pd.DataFrame(list(historial_eventos))
+    with data_lock:
+        if not historial_eventos:
+            return None
+        df = pd.DataFrame(list(historial_eventos))
     df_scalp = df[df["evaluado_scalp"] == True]
     df_tend = df[df["evaluado_tend"] == True]
     df_largo = df[df["evaluado_largo"] == True]
@@ -1238,7 +1280,7 @@ def generar_informe_resultados_como_texto():
     if df_scalp.empty and df_tend.empty and df_largo.empty:
         return None
 
-    informe = "📊 **INFORME DE RESULTADOS (V13.6)**\n\n"
+    informe = "📊 **INFORME DE RESULTADOS (V13.7)**\n\n"
     for tipo in df["tipo"].unique():
         informe += f"🔹 {tipo.upper()}\n"
 
@@ -1251,7 +1293,6 @@ def generar_informe_resultados_como_texto():
             neutros = len(subset[subset["resultado_scalp"] == "NEUTRO"])
             tasa = exitos / total * 100 if total else 0
             informe += f"   ⏱️ Scalping (2v): {total} ev | Éxito: {exitos} ({tasa:.1f}%) | Fracaso: {fracasos} | Neutro: {neutros}\n"
-            # Desglose por volumen
             if "volumen" in subset.columns:
                 vol_bajo = subset[subset["volumen"] < 300]
                 vol_medio = subset[(subset["volumen"] >= 300) & (subset["volumen"] <= 600)]
@@ -1268,7 +1309,6 @@ def generar_informe_resultados_como_texto():
                     ex = len(vol_alto[vol_alto["resultado_scalp"] == "EXITO"])
                     to = len(vol_alto)
                     informe += f"      📊 Vol >600: {to} ops, éxito {ex/to*100:.1f}%\n"
-            # Score promedio
             if "score_norm" in subset.columns:
                 score_exito = subset[subset["resultado_scalp"] == "EXITO"]["score_norm"].mean() if len(subset[subset["resultado_scalp"] == "EXITO"]) > 0 else 0
                 score_fracaso = subset[subset["resultado_scalp"] == "FRACASO"]["score_norm"].mean() if len(subset[subset["resultado_scalp"] == "FRACASO"]) > 0 else 0
@@ -1298,7 +1338,35 @@ def generar_informe_resultados_como_texto():
     return informe
 
 # =========================
-# COMANDOS DE TELEGRAM
+# GUARDADO PERIÓDICO DEL HISTORIAL
+# =========================
+
+def guardar_historial_si_necesario(ahora):
+    global ultimo_guardado
+    # Guardar cada 10 minutos o si cambió de hora (minuto 0)
+    if (ahora - ultimo_guardado) >= timedelta(minutes=10) or ahora.minute == 0:
+        try:
+            with data_lock:
+                with open(HISTORIAL_FILE, "w") as f:
+                    json.dump(list(historial_eventos), f)
+            ultimo_guardado = ahora
+        except Exception as e:
+            print(f"Error guardando historial: {e}")
+
+def limpiar_alerted_liquidity_si_necesario(ahora):
+    global ultima_limpieza_liquidity
+    # Limpiar cada 24 horas
+    if (ahora - ultima_limpieza_liquidity) >= timedelta(hours=24):
+        with data_lock:
+            # Eliminar entradas con más de 7 días
+            limite = (ahora - timedelta(days=7)).timestamp()
+            claves_a_borrar = [k for k, ts in alerted_liquidity_ts.items() if ts < limite]
+            for k in claves_a_borrar:
+                alerted_liquidity_ts.pop(k, None)
+        ultima_limpieza_liquidity = ahora
+
+# =========================
+# COMANDOS DE TELEGRAM (con lock)
 # =========================
 
 ultimo_update_id = None
@@ -1335,17 +1403,13 @@ def procesar_comando(texto, chat_id):
 # =========================
 
 def evaluar():
-    global zona_actual, zona_consumida, alerted_liquidity, alerted_proximidad, last_event_time, last_mapa_time, regimen_actual, zonas_macro
+    global zona_actual, zona_consumida, last_event_time, regimen_actual, zonas_macro, alerted_proximidad
 
     ahora = datetime.now(UTC)
     hora_str = ahora.strftime('%H:%M')
 
-    # Obtener datos
-    df_1h = obtener_candles_spot(INTERVAL_MACRO, limit=400)   # para tener al menos 336 velas
-    df_4h = obtener_candles_spot(INTERVAL_BIAS, limit=100)
-    df_entry = obtener_candles_spot(INTERVAL_ENTRY)
-    df_oi = obtener_open_interest_hist(period="5m", limit=200)
-    precio = obtener_precio_actual()
+    # Obtener todos los datos en paralelo
+    df_1h, df_4h, df_entry, df_oi, precio = obtener_todos_los_datos()
 
     if df_entry.empty or precio is None:
         return
@@ -1354,7 +1418,7 @@ def evaluar():
 
     bias = calcular_bias(df_1h, df_4h, precio)
 
-    # Detectar zonas spot (para radares 0,3,4)
+    # Detectar zonas spot
     zonas_high_spot, zonas_low_spot = detectar_zonas_spot(df_1h) if not df_1h.empty else ([], [])
     mejor_spot_arriba, mejor_spot_abajo = seleccionar_mejores_zonas_spot(zonas_high_spot, zonas_low_spot, precio)
 
@@ -1372,38 +1436,30 @@ def evaluar():
             abajo_oi.sort(key=lambda x: x["oi_total"], reverse=True)
             mejor_oi_abajo = abajo_oi[0]
 
-    # Actualizar zonas internas (Radar 1 y 2)
     actualizar_zonas_internas(mejor_oi_arriba, mejor_oi_abajo, mejor_spot_arriba, mejor_spot_abajo, precio, hora_str, bias)
 
     zona_ref_arriba = mejor_oi_arriba if mejor_oi_arriba else mejor_spot_arriba
     zona_ref_abajo = mejor_oi_abajo if mejor_oi_abajo else mejor_spot_abajo
     radar_proximidad_interno(zona_ref_arriba, zona_ref_abajo, precio, hora_str, bias)
 
-    # Zonas para radares de eventos
     zonas_arriba = [z for z in ([mejor_oi_arriba] if mejor_oi_arriba else []) + ([mejor_spot_arriba] if mejor_spot_arriba else []) if z]
     zonas_abajo = [z for z in ([mejor_oi_abajo] if mejor_oi_abajo else []) + ([mejor_spot_abajo] if mejor_spot_abajo else []) if z]
 
-    # Radar 0 (impulso)
     hubo_impulso = radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias)
 
-    # Obtener resultado del último impulso para transición de régimen
     resultado_impulso = None
-    if hubo_impulso and historial_eventos:
-        ultimo_impulso = next((e for e in reversed(historial_eventos) if e["tipo"] == "impulso" and e.get("evaluado_scalp")), None)
+    if hubo_impulso:
+        with data_lock:
+            ultimo_impulso = next((e for e in reversed(historial_eventos) if e["tipo"] == "impulso" and e.get("evaluado_scalp")), None)
         if ultimo_impulso:
             resultado_impulso = ultimo_impulso.get("resultado_scalp")
 
-    # Actualizar régimen y zonas macro (en 1h con 2 semanas)
     actualizar_regimen(df_1h, hubo_impulso, resultado_impulso)
-
-    # Radar 5 (estructura lenta)
     radar_estructura_lenta(precio, zonas_macro, regimen_actual)
-
-    # Radar 3 y 4 (sweep, breakout)
     radar_sweep(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
     radar_breakout(df_entry, zona_ref_arriba, zona_ref_abajo, precio, zonas_arriba, zonas_abajo, bias)
 
-    # Limpieza de alerted_proximidad
+    # Limpieza de alerted_proximidad (entradas viejas)
     keys_a_remover = []
     for key, ts in alerted_proximidad.items():
         if (ahora - ts) > timedelta(hours=2):
@@ -1411,34 +1467,37 @@ def evaluar():
     for key in keys_a_remover:
         alerted_proximidad.pop(key, None)
 
-    # Alerta de deriva silenciosa (NO MODIFICADA)
     alerta_deriva_silenciosa(precio, ahora)
-
-    # Sistema
     heartbeat()
     sin_eventos()
+
+    # Guardado periódico y limpieza
+    guardar_historial_si_necesario(ahora)
+    limpiar_alerted_liquidity_si_necesario(ahora)
 
 # =========================
 # BUCLE PRINCIPAL
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V13.6 (sweeps solo con volumen alto o score alto, macro con cooldown)...")
+    print("🚀 Iniciando BOT V13.7 (mejoras: HTTP paralelo, guardado cada 10min, locks, limpieza de liquidity)...")
     precio_inicial = obtener_precio_actual()
     hora_actual = datetime.now(UTC).strftime('%H:%M')
-    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.6)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
+    msg = f"🤖 BOT DE ARTURO FUNCIONANDO (V13.7)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}"
     enviar(msg)
 
     last_heartbeat_time = datetime.now(UTC)
     last_event_time = datetime.now(UTC)
-    last_mapa_time = None
+    ultimo_guardado = datetime.now(UTC)
+    ultima_limpieza_liquidity = datetime.now(UTC)
 
-    # Cargar historial
+    # Cargar historial anterior si existe
     if os.path.exists(HISTORIAL_FILE):
         try:
             with open(HISTORIAL_FILE, "r") as f:
                 data = json.load(f)
-                historial_eventos.extend(data[-2000:])
+                with data_lock:
+                    historial_eventos.extend(data[-2000:])
         except:
             pass
 
@@ -1457,11 +1516,3 @@ if __name__ == "__main__":
             enviar(f"⚠️ ERROR: {str(e)[:100]}")
             time.sleep(60)
         time.sleep(60)
-
-        # Guardar historial cada hora
-        if datetime.now(UTC).minute == 0:
-            try:
-                with open(HISTORIAL_FILE, "w") as f:
-                    json.dump(list(historial_eventos), f)
-            except:
-                pass

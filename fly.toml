@@ -1,0 +1,4 @@
+app = "btc-volume-bot-1"
+primary_region = "mia"
+
+[build]

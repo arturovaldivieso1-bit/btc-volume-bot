@@ -172,6 +172,8 @@ def enviar(msg):
         print(f"Error Telegram: {e}")
 
 def fmt(n):
+    if n is None:
+        return "N/D"
     return f"{int(n):,}"
 
 def obtener_candles_spot(interval, limit=200):
@@ -1226,9 +1228,19 @@ def evaluar():
 
 if __name__ == "__main__":
     print("🚀 Iniciando BOT V13.9 (atexit executor, OI global fix, locks completos, comentarios _procesar_breakout)...")
-    precio_inicial = obtener_precio_actual()
-    hora_actual    = datetime.now(UTC).strftime('%H:%M')
-    enviar(f"🤖 BOT DE ARTURO FUNCIONANDO (V13.9)\nHora UTC: {hora_actual}\nPrecio: {fmt(precio_inicial)}")
+
+    # Reintentar hasta 5 veces con pausa de 5s antes de fallar en el arranque
+    precio_inicial = None
+    for intento in range(5):
+        precio_inicial = obtener_precio_actual()
+        if precio_inicial is not None:
+            break
+        print(f"⚠️ Precio inicial None (intento {intento+1}/5), reintentando en 5s...")
+        time.sleep(5)
+
+    hora_actual = datetime.now(UTC).strftime('%H:%M')
+    precio_str  = fmt(precio_inicial) if precio_inicial is not None else "N/D"
+    enviar(f"🤖 BOT DE ARTURO FUNCIONANDO (V13.9)\nHora UTC: {hora_actual}\nPrecio: {precio_str}")
 
     last_heartbeat_time       = datetime.now(UTC)
     last_event_time           = datetime.now(UTC)

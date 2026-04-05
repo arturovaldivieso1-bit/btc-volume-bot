@@ -2,3 +2,6 @@ app = "btc-volume-bot-1"
 primary_region = "mia"
 
 [build]
+
+[processes]
+app = "python BOT_DE_ARTURO_V13.py"

@@ -2,7 +2,8 @@
 # BOT V13.12 – Radar 0 usa high/low para detectar mechazo intradía
 #   Cambio: price_change = max(high-open, open-low) / open * 100
 #   Cambio: direccion determinada por el mechazo mayor (no por el cierre)
-#   Todo lo demás igual que V13.11
+#   Ajuste: deriva silenciosa cada 1 hora (ALERTA_DERIVA_HORAS = 1)
+#   Ajuste: heartbeat cada 6 horas, solo a las 9:00 y 16:00 UTC
 
 import requests
 import pandas as pd
@@ -72,7 +73,7 @@ PESOS = {
     "validacion_spot": 2, "volumen_alto": 3
 }
 
-HEARTBEAT_HOURS        = 4
+HEARTBEAT_HOURS        = 6        # Cambiado de 4 a 6
 NO_EVENT_HOURS         = 6
 MAPA_COOLDOWN_MINUTOS  = 60
 RADAR2_COOLDOWN_MINUTOS = 120
@@ -91,7 +92,8 @@ ZONA_MACRO_ALERTA_DIST    = 0.01
 ZONA_MACRO_SETUP_DIST     = 0.003
 ZONA_MACRO_COOLDOWN_HORAS = 2
 
-ALERTA_DERIVA_HORAS      = 0.5
+# Cambiado de 0.5 a 1 (1 hora)
+ALERTA_DERIVA_HORAS      = 1
 ALERTA_DERIVA_PORCENTAJE = 0.65
 
 # =========================
@@ -130,7 +132,7 @@ def _cerrar_executor():
 atexit.register(_cerrar_executor)
 
 # =========================
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES (sin cambios)
 # =========================
 
 def peso_por_oi(oi_total):
@@ -491,11 +493,7 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
     if mejor_zona_abajo:  check_and_record(mejor_zona_abajo,  "LOW")
 
 # =========================
-# RADAR 0 – IMPULSO
-# CAMBIO V13.12: usa high/low para detectar mechazo intradía
-#   - price_change = max(high-open, open-low) / open * 100
-#   - direccion = lado del mechazo mayor (no del cierre)
-#   - el mensaje indica si la vela confirmó en esa dirección o fue mechazo sin cierre
+# RADAR 0 – IMPULSO (con mechazo)
 # =========================
 
 def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
@@ -530,13 +528,10 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     except:
         return False
 
-    # ── CAMBIO V13.12 ──────────────────────────────────────────────
-    # Calcula el mechazo máximo desde la apertura en ambas direcciones
-    high_change = (high_price - open_price) / open_price * 100   # mechazo alcista
-    low_change  = (open_price - low_price)  / open_price * 100   # mechazo bajista
+    high_change = (high_price - open_price) / open_price * 100
+    low_change  = (open_price - low_price)  / open_price * 100
     price_change = max(high_change, low_change)
 
-    # Dirección: el lado con el mechazo mayor determina el impulso
     if high_change >= low_change:
         direccion = "ALCISTA"
         emoji     = "🟢"
@@ -544,10 +539,8 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         direccion = "BAJISTA"
         emoji     = "🔴"
 
-    # ¿La vela confirmó el cierre en la misma dirección que el mechazo?
     cierre_confirmado = (direccion == "ALCISTA" and close_price > open_price) or \
                         (direccion == "BAJISTA" and close_price < open_price)
-    # ───────────────────────────────────────────────────────────────
 
     if price_change < IMPULSE_PRICE_CHANGE:
         return False
@@ -598,7 +591,6 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
         if volume > VOL_MIN_SWEEP or score_norm >= SCORE_UMBRAL_ACCION_IMPULSO:
             setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm)
 
-    # Etiqueta de confirmación de cierre para el mensaje
     confirmacion_str = "✅ cierre confirmado" if cierre_confirmado else "⚡ mechazo sin cierre"
 
     msg  = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10\n\n"
@@ -624,7 +616,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     return True
 
 # =========================
-# RADAR 3 (SWEEP) – sin cambios
+# RADAR 3 (SWEEP)
 # =========================
 
 def generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm):
@@ -735,7 +727,7 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             break
 
 # =========================
-# RADAR 4 (BREAKOUT) – sin cambios
+# RADAR 4 (BREAKOUT)
 # =========================
 
 def generar_setup_breakout(zona, precio_actual, direccion, score_norm):
@@ -921,17 +913,31 @@ def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
 # =========================
 
 def heartbeat():
+    """
+    Envía heartbeat solo a las 9:00 y 16:00 UTC, con cooldown de 6 horas.
+    """
     global last_heartbeat_time
     ahora = datetime.now(UTC)
-    if last_heartbeat_time is None:
-        last_heartbeat_time = ahora
+    # Comprobar si la hora actual es 9:00 o 16:00 (con margen de 1 minuto)
+    hora_min = ahora.strftime('%H:%M')
+    es_hora_heartbeat = hora_min in ("09:00", "16:00")
+    if not es_hora_heartbeat:
         return
-    if (ahora - last_heartbeat_time) > timedelta(hours=HEARTBEAT_HOURS):
-        precio = obtener_precio_actual() or 0
-        msg = (f"🤖 BOT DE ARTURO FUNCIONANDO (V13.12)\n"
-               f"Hora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}")
-        enviar(msg)
-        last_heartbeat_time = ahora
+
+    if last_heartbeat_time is None:
+        # Enviar inmediatamente la primera vez que se alcance la hora
+        pass
+    else:
+        # No enviar si ha pasado menos de HEARTBEAT_HOURS (6) desde el último envío
+        if (ahora - last_heartbeat_time) < timedelta(hours=HEARTBEAT_HOURS):
+            return
+
+    # Enviar heartbeat
+    precio = obtener_precio_actual() or 0
+    msg = (f"🤖 BOT DE ARTURO FUNCIONANDO (V13.12)\n"
+           f"Hora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}")
+    enviar(msg)
+    last_heartbeat_time = ahora
 
 def sin_eventos():
     global last_event_time
@@ -1085,7 +1091,6 @@ ultimo_update_id = None
 
 def obtener_mensajes():
     global ultimo_update_id
-    url    = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     params_get = {"timeout": 30, "offset": ultimo_update_id}
     url_upd = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     try:

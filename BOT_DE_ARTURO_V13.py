@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# BOT V13.12 – Radar 0 usa high/low para detectar mechazo intradía
-#   Cambio: price_change = max(high-open, open-low) / open * 100
-#   Cambio: direccion determinada por el mechazo mayor (no por el cierre)
-#   Ajuste: deriva silenciosa cada 1 hora (ALERTA_DERIVA_HORAS = 1)
-#   Ajuste: heartbeat cada 6 horas, solo a las 9:00 y 16:00 UTC
+# BOT V13.13 – Pre‑impulso score + alerta separada + heartbeat horario Chile (UTC-4)
+#   - Umbral impulso reducido a 0.5%
+#   - Alerta cuando pre_score >= 6 (cooldown 30 min)
+#   - Heartbeat solo a las 9:00 y 16:00 Chile (UTC-4)
+#   - Todo lo demás igual que V13.12
 
 import requests
 import pandas as pd
@@ -46,7 +46,8 @@ OI_CONFIANZA_BAJA  = 100_000_000
 
 SPOT_FUTUROS_TOLERANCIA = 0.005
 
-IMPULSE_PRICE_CHANGE = 0.65
+# Umbral de impulso reducido a 0.5% (antes 0.65)
+IMPULSE_PRICE_CHANGE = 0.5
 IMPULSE_COOLDOWN     = 300
 
 SWEEP_VOLUME_FACTOR   = 1.2
@@ -73,7 +74,6 @@ PESOS = {
     "validacion_spot": 2, "volumen_alto": 3
 }
 
-HEARTBEAT_HOURS        = 6        # Cambiado de 4 a 6
 NO_EVENT_HOURS         = 6
 MAPA_COOLDOWN_MINUTOS  = 60
 RADAR2_COOLDOWN_MINUTOS = 120
@@ -92,9 +92,18 @@ ZONA_MACRO_ALERTA_DIST    = 0.01
 ZONA_MACRO_SETUP_DIST     = 0.003
 ZONA_MACRO_COOLDOWN_HORAS = 2
 
-# Cambiado de 0.5 a 1 (1 hora)
 ALERTA_DERIVA_HORAS      = 1
 ALERTA_DERIVA_PORCENTAJE = 0.65
+
+# Parámetros para pre‑impulso score
+COMPRESION_LOOKBACK = 10      # velas de 5m = 50 minutos
+COMPRESION_FACTOR = 0.6       # rango actual < 60% de la media
+VOL_RATIO_ALTO = 1.3          # para sumar 2 puntos
+VOL_RATIO_MEDIO = 1.1         # para sumar 1 punto
+BUILDUP_MIN_TOQUES = 4
+TIEMPO_SIN_IMPULSO_MIN = 30   # minutos
+PRE_SCORE_ALERTA_UMBRAL = 6   # enviar alerta separada cuando score >= 6
+PRE_SCORE_ALERTA_COOLDOWN = 30 # minutos
 
 # =========================
 # ESTADO GLOBAL
@@ -102,6 +111,7 @@ ALERTA_DERIVA_PORCENTAJE = 0.65
 
 last_impulse_time  = None
 last_heartbeat_time = None
+last_pre_alert_time = None   # para cooldown de alerta de pre‑impulso
 last_event_time    = None
 last_mapa_time     = None
 zona_actual        = None
@@ -132,7 +142,7 @@ def _cerrar_executor():
 atexit.register(_cerrar_executor)
 
 # =========================
-# FUNCIONES AUXILIARES (sin cambios)
+# FUNCIONES AUXILIARES
 # =========================
 
 def peso_por_oi(oi_total):
@@ -322,6 +332,63 @@ def registrar_evento_para_patron(tipo, direccion):
         enviar(f"⚠️ POSIBLE ACUMULACIÓN: 3 sweeps {direccion} consecutivos")
 
 # =========================
+# FUNCIONES PARA PRE‑IMPULSO SCORE
+# =========================
+
+def detectar_compresion(df_entry, lookback=COMPRESION_LOOKBACK, factor=COMPRESION_FACTOR):
+    """Detecta si el rango (high-low) actual es inferior al factor * media de lookback velas."""
+    if df_entry.empty or len(df_entry) < lookback:
+        return False
+    rangos = (df_entry["high"] - df_entry["low"]).tail(lookback)
+    media_rango = rangos.mean()
+    if media_rango == 0:
+        return False
+    rango_actual = df_entry["high"].iloc[-1] - df_entry["low"].iloc[-1]
+    return rango_actual < media_rango * factor
+
+def detectar_buildup(zona, df_oi, min_toques=BUILDUP_MIN_TOQUES):
+    """Detecta acumulación de liquidez: zona con toques >= min_toques y OI creciente en últimas 3 velas."""
+    if zona is None or df_oi.empty or len(df_oi) < 3:
+        return False
+    if zona.get("toques", 0) < min_toques:
+        return False
+    oi_vals = df_oi["sumOpenInterestValue"].tail(3).tolist()
+    return all(oi_vals[i] < oi_vals[i+1] for i in range(len(oi_vals)-1))
+
+def detectar_patron_sweeps(ultimos_eventos):
+    """Detecta 2 sweeps consecutivos en la misma dirección."""
+    if len(ultimos_eventos) < 2:
+        return False
+    ultimos = list(ultimos_eventos)[-2:]
+    return ultimos[0] == ultimos[1] and "sweep" in ultimos[0]
+
+def tiempo_sin_impulso(last_impulse_time, ahora, minutos=TIEMPO_SIN_IMPULSO_MIN):
+    if last_impulse_time is None:
+        return False
+    return (ahora - last_impulse_time).total_seconds() > minutos * 60
+
+def calcular_pre_impulso_score(df_entry, df_oi, zona_referencia, ultimos_eventos, last_impulse_time, ahora):
+    score = 0
+    if detectar_compresion(df_entry):
+        score += 2
+    if len(df_entry) >= 20:
+        vol_medio = df_entry["volume"].rolling(20).mean().iloc[-1]
+        vol_actual = df_entry["volume"].iloc[-1]
+        if vol_medio > 0:
+            ratio = vol_actual / vol_medio
+            if ratio > VOL_RATIO_ALTO:
+                score += 2
+            elif ratio > VOL_RATIO_MEDIO:
+                score += 1
+    if detectar_buildup(zona_referencia, df_oi):
+        score += 2
+    if detectar_patron_sweeps(ultimos_eventos):
+        score += 2
+    if tiempo_sin_impulso(last_impulse_time, ahora):
+        score += 1
+    return min(score, 10)
+
+# =========================
 # RÉGIMEN Y ZONAS MACRO (50 velas 1h)
 # =========================
 
@@ -493,7 +560,7 @@ def radar_proximidad_interno(mejor_zona_arriba, mejor_zona_abajo, precio, hora, 
     if mejor_zona_abajo:  check_and_record(mejor_zona_abajo,  "LOW")
 
 # =========================
-# RADAR 0 – IMPULSO (con mechazo)
+# RADAR 0 – IMPULSO (con pre‑impulso score y umbral 0.5%)
 # =========================
 
 def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
@@ -512,7 +579,7 @@ def generar_setup_impulso(zona, precio_actual, direccion, score_norm):
     confianza = "ALTA" if score_norm >= 7 else "MEDIA" if score_norm >= 5 else "BAJA"
     return {"accion": accion, "entrada": entrada, "sl": sl, "tp": tp, "confianza": confianza}
 
-def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
+def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias, pre_score=0):
     global last_impulse_time, last_event_time, regimen_actual
     if df_entry.empty or len(df_entry) < 3:
         return False
@@ -592,6 +659,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
             setup = generar_setup_impulso(zona_relevante, precio_actual, direccion, score_norm)
 
     confirmacion_str = "✅ cierre confirmado" if cierre_confirmado else "⚡ mechazo sin cierre"
+    pre_score_text = f"🔮 Pre‑impulso: {pre_score}/10" if pre_score > 0 else ""
 
     msg  = f"🚀 **IMPULSO {direccion} {emoji}** – Score {score_norm}/10\n\n"
     msg += f"Precio: {fmt(precio_actual)} - Hora UTC: {ahora.strftime('%H:%M')}\n"
@@ -599,6 +667,8 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     msg += f"High: {fmt(high_price)} | Low: {fmt(low_price)}\n"
     msg += f"Volumen: {volume:.0f} BTC\n"
     msg += f"Bias: {bias}\n\n"
+    if pre_score_text:
+        msg += f"{pre_score_text}\n"
     if prob_text:
         msg += f"{prob_text}\n"
     if zona_relevante:
@@ -616,7 +686,7 @@ def radar_impulse(df_entry, precio_actual, zonas_arriba, zonas_abajo, bias):
     return True
 
 # =========================
-# RADAR 3 (SWEEP)
+# RADAR 3 (SWEEP) – sin cambios
 # =========================
 
 def generar_setup_sweep(zona, precio_actual, direccion_rev, score_norm):
@@ -727,7 +797,7 @@ def radar_sweep(df_entry, mejor_zona_arriba, mejor_zona_abajo, precio_actual, zo
             break
 
 # =========================
-# RADAR 4 (BREAKOUT)
+# RADAR 4 (BREAKOUT) – sin cambios
 # =========================
 
 def generar_setup_breakout(zona, precio_actual, direccion, score_norm):
@@ -909,35 +979,34 @@ def radar_estructura_lenta(precio_actual, zonas_macro, regimen):
         last_event_time = ahora
 
 # =========================
-# ALERTAS DE SISTEMA Y DERIVA SILENCIOSA
+# ALERTAS DE SISTEMA, HEARTBEAT HORARIO CHILE, DERIVA SILENCIOSA
 # =========================
 
 def heartbeat():
     """
-    Envía heartbeat solo a las 9:00 y 16:00 UTC, con cooldown de 6 horas.
+    Envía heartbeat solo a las 9:00 y 16:00 hora Chile (UTC-4).
+    Usa un offset fijo de -4 horas (ajustable).
     """
     global last_heartbeat_time
-    ahora = datetime.now(UTC)
-    # Comprobar si la hora actual es 9:00 o 16:00 (con margen de 1 minuto)
-    hora_min = ahora.strftime('%H:%M')
-    es_hora_heartbeat = hora_min in ("09:00", "16:00")
-    if not es_hora_heartbeat:
+    ahora_utc = datetime.now(UTC)
+    hora_chile = ahora_utc - timedelta(hours=4)
+    hora_str = hora_chile.strftime('%H:%M')
+    es_hora = (hora_str == "09:00" or hora_str == "16:00")
+    if not es_hora:
         return
 
     if last_heartbeat_time is None:
-        # Enviar inmediatamente la primera vez que se alcance la hora
         pass
     else:
-        # No enviar si ha pasado menos de HEARTBEAT_HOURS (6) desde el último envío
-        if (ahora - last_heartbeat_time) < timedelta(hours=HEARTBEAT_HOURS):
+        if (ahora_utc - last_heartbeat_time) < timedelta(hours=1):
             return
 
-    # Enviar heartbeat
     precio = obtener_precio_actual() or 0
-    msg = (f"🤖 BOT DE ARTURO FUNCIONANDO (V13.12)\n"
-           f"Hora UTC: {ahora.strftime('%H:%M')}\nPrecio: {fmt(precio)}\nRégimen: {regimen_actual}")
+    msg = (f"🤖 BOT DE ARTURO FUNCIONANDO (V13.13)\n"
+           f"Hora Chile (UTC-4): {hora_chile.strftime('%H:%M')}\n"
+           f"Precio: {fmt(precio)}\nRégimen: {regimen_actual}")
     enviar(msg)
-    last_heartbeat_time = ahora
+    last_heartbeat_time = ahora_utc
 
 def sin_eventos():
     global last_event_time
@@ -949,7 +1018,7 @@ def sin_eventos():
         precio = obtener_precio_actual() or 0
         msg = (f"⚠️ MERCADO SIN EVENTOS RELEVANTES\n"
                f"Tiempo sin señales: {NO_EVENT_HOURS}h\n"
-               f"Precio: {fmt(precio)} | Hora: {ahora.strftime('%H:%M')}\n"
+               f"Precio: {fmt(precio)} | Hora UTC: {ahora.strftime('%H:%M')}\n"
                f"Estado: lateral / baja volatilidad")
         enviar(msg)
         last_event_time = ahora
@@ -1022,7 +1091,7 @@ def generar_informe_resultados_como_texto():
     if df_scalp.empty and df_tend.empty and df_largo.empty:
         return None
 
-    informe = "📊 **INFORME DE RESULTADOS (V13.12)**\n\n"
+    informe = "📊 **INFORME DE RESULTADOS (V13.13)**\n\n"
     for tipo in df["tipo"].unique():
         informe += f"🔹 {tipo.upper()}\n"
 
@@ -1120,6 +1189,7 @@ def procesar_comando(texto, chat_id):
 
 def evaluar():
     global zona_actual, zona_consumida, last_event_time, regimen_actual, zonas_macro, alerted_proximidad
+    global last_pre_alert_time
 
     ahora    = datetime.now(UTC)
     hora_str = ahora.strftime('%H:%M')
@@ -1152,7 +1222,19 @@ def evaluar():
     zonas_arriba = [z for z in [mejor_oi_arriba, mejor_spot_arriba] if z]
     zonas_abajo  = [z for z in [mejor_oi_abajo,  mejor_spot_abajo]  if z]
 
-    hubo_impulso = radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias)
+    # Calcular pre‑impulso score (usando la mejor zona relevante, si existe)
+    zona_referencia = zonas_arriba[0] if zonas_arriba else (zonas_abajo[0] if zonas_abajo else None)
+    with data_lock:
+        snapshot_ultimos = list(ultimos_eventos)
+    pre_score = calcular_pre_impulso_score(df_entry, df_oi, zona_referencia, snapshot_ultimos, last_impulse_time, ahora)
+
+    # Alerta separada si pre_score alto y respeta cooldown
+    if pre_score >= PRE_SCORE_ALERTA_UMBRAL:
+        if last_pre_alert_time is None or (ahora - last_pre_alert_time) > timedelta(minutes=PRE_SCORE_ALERTA_COOLDOWN):
+            enviar(f"⚠️ MERCADO LISTO PARA IMPULSO (score {pre_score}/10) – Hora UTC: {ahora.strftime('%H:%M')}")
+            last_pre_alert_time = ahora
+
+    hubo_impulso = radar_impulse(df_entry, precio, zonas_arriba, zonas_abajo, bias, pre_score)
 
     resultado_impulso = None
     if hubo_impulso:
@@ -1183,7 +1265,7 @@ def evaluar():
 # =========================
 
 if __name__ == "__main__":
-    print("🚀 Iniciando BOT V13.12 (Radar 0: high/low mechazo + confirmacion de cierre)...")
+    print("🚀 Iniciando BOT V13.13 (pre‑impulso score, alerta separada, heartbeat horario Chile, umbral 0.5%)...")
 
     precio_inicial = None
     for intento in range(5):
@@ -1195,9 +1277,10 @@ if __name__ == "__main__":
 
     hora_actual = datetime.now(UTC).strftime('%H:%M')
     precio_str  = fmt(precio_inicial) if precio_inicial is not None else "N/D"
-    enviar(f"🤖 BOT DE ARTURO FUNCIONANDO (V13.12)\nHora UTC: {hora_actual}\nPrecio: {precio_str}")
+    enviar(f"🤖 BOT DE ARTURO FUNCIONANDO (V13.13)\nHora UTC: {hora_actual}\nPrecio: {precio_str}")
 
     last_heartbeat_time       = datetime.now(UTC)
+    last_pre_alert_time       = None
     last_event_time           = datetime.now(UTC)
     ultimo_guardado           = datetime.now(UTC)
     ultima_limpieza_liquidity = datetime.now(UTC)

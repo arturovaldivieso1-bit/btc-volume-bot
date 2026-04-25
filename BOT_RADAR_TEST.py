@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
 # BOT V14‑ESENCIA PLUS – Radar de contexto con memoria histórica
-# Correcciones aplicadas:
 #   [FIX 1] Bug resumen_horario: msg se cortaba si oi_24h_var era None
-#   [FIX 2] alerta_movimiento_brusco: índice correcto para precio hace ~1h (ciclos de 45s)
-#   [FIX 3] alerta_ruptura_rango: usa pivotes reales para siguiente nivel, no el nivel roto
-#   [FIX 4] guardar_memoria: solo guarda cada 10 min o en nuevo toque, no cada 45s
-#   [FIX 5] dias_en_rango_actual: más robusto, umbral dinámico según volatilidad reciente
-#   [NUEVO] obtener_contexto_nivel: calcula tasa de rebote real con timestamps guardados
-# Ajustes v14.1:
-#   - IMPULSO_5M_PCT vuelve a 0.65% (según preferencia)
-#   - ultimos_movimientos_1h: acumula variaciones horarias reales (no cada 45s)
-#   - dias_en_rango_actual: guard ante DataFrames con menos de 48 filas reforzado
+#   [FIX 2] alerta_movimiento_brusco: índice correcto + cooldown 1h por dirección
+#   [FIX 3] alerta_ruptura_rango: usa pivotes reales para siguiente nivel
+#   [FIX 4] guardar_memoria: solo guarda cada 10 min o en nuevo toque
+#   [FIX 5] dias_en_rango_actual: umbral dinámico según volatilidad reciente
+#   [NUEVO] obtener_contexto_nivel: calcula tasa de rebote real con timestamps
 
 import requests
 import pandas as pd
@@ -36,7 +31,7 @@ INTERVAL_5M = "5m"
 
 LOOKBACK_PIVOTS       = 80      # velas 1h para buscar máximos/mínimos
 PROXIMIDAD_NIVEL      = 0.001   # 0.1% para considerar "toque"
-IMPULSO_5M_PCT        = 0.65    # % mínimo para alerta de vela 5m
+IMPULSO_5M_PCT        = 0.8     # % mínimo para alerta de vela 5m
 MOVIMIENTO_BRUSCO_PCT = 1.5     # % mínimo en 1h
 DIAS_ESTRECHO_MIN     = 3       # días de rango contenido para avisar
 
@@ -48,18 +43,18 @@ CICLOS_POR_HORA = 80
 # =========================
 # ESTADO GLOBAL
 # =========================
-ultimos_precios       = deque(maxlen=CICLOS_POR_HORA * 24)  # 24h de precios
+ultimos_precios        = deque(maxlen=CICLOS_POR_HORA * 24)  # 24h de precios
 ultimos_movimientos_1h = deque(maxlen=168)
-ultima_deriva_time    = None
-ultimo_precio_deriva  = None
-last_heartbeat        = None
-last_resumen          = None
-memoria_niveles       = {}
-ultimo_alerta_nivel   = {}
-ultima_ruptura_alerta = {}
-ultimo_guardado_mem   = None   # [FIX 4] control de guardado
-ultimo_registro_mov   = None   # [DETALLE 3] control para registrar movimientos cada 1h real
-executor              = ThreadPoolExecutor(max_workers=5)
+ultima_deriva_time     = None
+ultimo_precio_deriva   = None
+last_heartbeat         = None
+last_resumen           = None
+memoria_niveles        = {}
+ultimo_alerta_nivel    = {}
+ultima_ruptura_alerta  = {}
+ultimo_guardado_mem    = None
+ultima_alerta_brusco   = {}   # cooldown por dirección ("ALZA"/"BAJA")
+executor               = ThreadPoolExecutor(max_workers=5)
 
 def _cerrar():
     executor.shutdown(wait=False)
@@ -91,7 +86,7 @@ def obtener_candles(interval, limit=100):
         ])
         for c in ["open","high","low","close","volume"]:
             df[c] = df[c].astype(float)
-        df["time_dt"] = pd.to_datetime(df["time"], unit="ms")
+        df["time_dt"] = pd.to_datetime(df["time"], unit='ms')
         return df
     except Exception as e:
         print(f"Error velas {interval}: {e}")
@@ -114,7 +109,7 @@ def obtener_oi(limit=300):
         data = requests.get(url, params=params, timeout=10).json()
         df = pd.DataFrame(data)
         df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
         return df
     except:
         return pd.DataFrame()
@@ -261,46 +256,34 @@ def dias_en_rango_actual(df_1h, precio):
     """
     [FIX 5] Calcula días consecutivos en rango estrecho.
     Umbral dinámico: rango diario < 50% de la volatilidad media de los últimos 10 días.
-    [DETALLE 2] Guard reforzado: requiere mínimo 48 filas y maneja huecos en el DataFrame.
     """
-    if df_1h.empty or len(df_1h) < 48 or precio == 0:
+    if df_1h.empty or len(df_1h) < 48:
         return 0, 0, 0
 
     # Volatilidad media de los últimos 10 días (en %)
     rangos_diarios = []
     for i in range(10):
-        fin   = len(df_1h) - 24 * i
-        inicio = fin - 24
-        if inicio < 0 or fin <= 0:
-            break
-        seg = df_1h.iloc[inicio:fin]
-        if len(seg) >= 12:   # acepta días parciales si hay al menos 12 velas
+        seg = df_1h.iloc[-(24*(i+1)):-(24*i) if i > 0 else len(df_1h)]
+        if len(seg) >= 12:
             r = (seg["high"].max() - seg["low"].min()) / precio
             rangos_diarios.append(r)
-
     if not rangos_diarios:
         return 0, 0, 0
     umbral = np.mean(rangos_diarios) * 0.5  # estrecho = menos del 50% de la media
 
     dias = 0
-    max_dias = min(15, len(df_1h) // 24)
-    for i in range(1, max_dias + 1):
-        fin   = len(df_1h) - 24 * (i - 1)
-        inicio = fin - 24
-        if inicio < 0:
-            break
-        seg = df_1h.iloc[inicio:fin]
+    for i in range(1, min(15, len(df_1h) // 24) + 1):
+        seg = df_1h.iloc[-24*i:-24*(i-1) if i > 1 else len(df_1h)]
         if len(seg) < 12:
-            break   # hueco real en los datos, detenemos el conteo
+            continue
         rango_dia = (seg["high"].max() - seg["low"].min()) / precio
         if rango_dia < umbral:
             dias += 1
         else:
             break
 
-    n_velas = max(dias * 24, 24)
-    min_rango = df_1h["low"].tail(n_velas).min()
-    max_rango = df_1h["high"].tail(n_velas).max()
+    min_rango = df_1h["low"].tail(24 * max(dias, 1)).min()
+    max_rango = df_1h["high"].tail(24 * max(dias, 1)).max()
     return dias, min_rango, max_rango
 
 # =========================
@@ -361,7 +344,8 @@ def alerta_nivel(precio, nivel, tipo_nivel, df_1h=None):
     enviar(msg)
 
 def alerta_movimiento_brusco(precio_actual_val):
-    """[FIX 2] Usa índice correcto para precio hace ~1h según ciclos de 45s."""
+    """[FIX 2] Usa índice correcto para precio hace ~1h. Cooldown de 1h por dirección."""
+    global ultima_alerta_brusco
     ahora = datetime.now(UTC)
     if len(ultimos_precios) < CICLOS_POR_HORA:
         return
@@ -369,6 +353,13 @@ def alerta_movimiento_brusco(precio_actual_val):
     var = abs(precio_actual_val - precio_hace_1h) / precio_hace_1h * 100
     if var >= MOVIMIENTO_BRUSCO_PCT:
         direccion = "ALZA" if precio_actual_val > precio_hace_1h else "BAJA"
+
+        # Cooldown de 1h por dirección
+        if direccion in ultima_alerta_brusco:
+            if (ahora - ultima_alerta_brusco[direccion]) < timedelta(hours=1):
+                return
+        ultima_alerta_brusco[direccion] = ahora
+
         emoji = "🔥" if direccion == "ALZA" else "❄️"
 
         # Contexto: ¿es el mayor movimiento reciente?
@@ -401,7 +392,6 @@ def alerta_ruptura_rango(df_1h, precio, pivotes_h, pivotes_l):
             return
         ultima_ruptura_alerta[key_up] = ahora
         dias_rango, _, _ = dias_en_rango_actual(df_1h, precio)
-        # [FIX 3] siguiente resistencia en pivotes reales por encima del precio actual
         sig_res = nivel_mas_cercano(precio, pivotes_h, es_soporte=False)
         sig_txt = f"\nPróxima resistencia: {fmt(sig_res)}" if sig_res else ""
         msg = (f"🚨 RUPTURA ALCISTA: supera máximo de 7 días ({fmt(max_7d)})\n"
@@ -416,7 +406,6 @@ def alerta_ruptura_rango(df_1h, precio, pivotes_h, pivotes_l):
             return
         ultima_ruptura_alerta[key_down] = ahora
         dias_rango, _, _ = dias_en_rango_actual(df_1h, precio)
-        # [FIX 3] siguiente soporte en pivotes reales por debajo del precio actual
         sig_sop = nivel_mas_cercano(precio, pivotes_l, es_soporte=True)
         sig_txt = f"\nPróximo soporte: {fmt(sig_sop)}" if sig_sop else ""
         msg = (f"🚨 RUPTURA BAJISTA: pierde mínimo de 7 días ({fmt(min_7d)})\n"
@@ -506,7 +495,7 @@ def resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivot
 # =========================
 def main():
     global ultima_deriva_time, ultimo_precio_deriva
-    global last_heartbeat, last_resumen, memoria_niveles, ultimo_registro_mov
+    global last_heartbeat, last_resumen, memoria_niveles
 
     memoria_niveles = cargar_memoria()
 
@@ -547,20 +536,15 @@ def main():
             soporte     = nivel_mas_cercano(precio, pivotes_l, es_soporte=True)
             resistencia = nivel_mas_cercano(precio, pivotes_h, es_soporte=False)
 
-            # 2. Memoria de niveles — [FIX 4] guardar solo si hubo nuevo toque
+            # 2. Memoria de niveles — guardar solo si hubo nuevo toque
             nuevo_toque = actualizar_memoria_niveles(pivotes_h, pivotes_l, precio, ahora)
             guardar_memoria(memoria_niveles, forzar=nuevo_toque)
 
-            # 3. Registrar precio cada ciclo y movimiento horario real
-            # [DETALLE 3] ultimos_movimientos_1h solo acumula variaciones reales de 1h
-            # para que el contexto "mayor movimiento en N horas" sea preciso
+            # 3. Registrar precio y movimiento
             if ultimos_precios:
-                if ultimo_registro_mov is None or (ahora - ultimo_registro_mov) >= timedelta(hours=1):
-                    precio_hace_1h_real = ultimos_precios[-CICLOS_POR_HORA] if len(ultimos_precios) >= CICLOS_POR_HORA else ultimos_precios[0]
-                    var_1h_real = (precio - precio_hace_1h_real) / precio_hace_1h_real * 100
-                    dir_ = "ALCISTA" if var_1h_real > 0 else "BAJISTA"
-                    ultimos_movimientos_1h.append((var_1h_real, dir_, ahora))
-                    ultimo_registro_mov = ahora
+                var1m = (precio - ultimos_precios[-1]) / ultimos_precios[-1] * 100
+                dir_  = "ALCISTA" if var1m > 0 else "BAJISTA"
+                ultimos_movimientos_1h.append((var1m, dir_, ahora))
             ultimos_precios.append(precio)
 
             # 4. Calcular sesgo una vez

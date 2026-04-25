@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import os   # <-- IMPRESCINDIBLE: lo usamos en la línea siguiente
+
 # ╔══════════════════════════════════════════════════════════╗
 # ║   CONFIGURACIÓN – MODIFICA SOLO ESTE BLOQUE            ║
 # ╚══════════════════════════════════════════════════════════╝
@@ -32,7 +34,6 @@ import requests
 import pandas as pd
 import numpy as np
 import time
-import os
 import json
 import threading
 from datetime import datetime, timedelta, UTC

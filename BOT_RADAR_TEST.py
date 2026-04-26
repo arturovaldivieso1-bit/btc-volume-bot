@@ -21,8 +21,8 @@ PROXIMIDAD_NIVEL      = 0.001    # % que define "tocar" un nivel (0.001 = 0.1%)
 
 # --- Alertas de precio ---
 IMPULSO_5M_PCT        = 0.65     # % mínimo de mecha/cuerpo en vela 5m para avisar
-MOVIMIENTO_BRUSCO_PCT = 1.0      # % mínimo de variación en 1h para avisar (antes 1.5)
-DIAS_ESTRECHO_MIN     = 3        # días consecutivos de rango pequeño (solo informativo)
+MOVIMIENTO_BRUSCO_PCT = 1.0      # % mínimo de variación en 1h para avisar
+DIAS_ESTRECHO_MIN     = 3        # días consecutivos de rango pequeño (informativo)
 
 # --- Archivo de memoria ---
 MEMORIA_NIVELES_FILE  = "memoria_niveles.json"
@@ -46,7 +46,7 @@ import atexit
 # =========================
 ultima_deriva_time     = None
 ultimo_precio_deriva   = None
-ultimo_precio_resumen  = None      # ya casi no se usa, se mantiene por si algún día reactivas el resumen
+ultimo_precio_resumen  = None
 last_heartbeat         = None
 last_resumen           = None
 memoria_niveles        = {}
@@ -54,6 +54,7 @@ ultimo_alerta_nivel    = {}
 ultima_alerta_global   = None
 ultima_ruptura_alerta  = {}
 ultima_alerta_brusco   = {}
+ultimo_timestamp_impulso = None  # <-- NUEVO: evita repetir alerta de impulso en la misma vela
 executor               = ThreadPoolExecutor(max_workers=5)
 
 def _cerrar():
@@ -222,9 +223,10 @@ def calcular_sesgo(df_1h, precio):
     return "LATERAL"
 
 # =========================
-# ALERTA DE IMPULSO (VELA CERRADA)
+# ALERTA DE IMPULSO (CON COOLDOWN POR VELA)
 # =========================
 def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
+    global ultimo_timestamp_impulso
     if df_5m.empty or len(df_5m) < 2:
         return
 
@@ -232,13 +234,18 @@ def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
     ultima_vela = df_5m.iloc[-1]
     cierre_teorico = ultima_vela["time_dt"] + timedelta(minutes=5)
 
-    # Si la última vela todavía se está formando, analizamos la anterior (ya cerrada)
     if ahora < cierre_teorico:
         if len(df_5m) < 3:
             return
         vela = df_5m.iloc[-2]
     else:
         vela = ultima_vela
+
+    # --- Cooldown por vela: si ya alertamos esta misma, no repetir ---
+    clave_vela = vela["time_dt"]
+    if ultimo_timestamp_impulso is not None and ultimo_timestamp_impulso == clave_vela:
+        return
+    # ----------------------------------------------------------------
 
     open_, high, low, close, vol = (
         vela["open"], vela["high"], vela["low"], vela["close"], vela["volume"]
@@ -248,6 +255,9 @@ def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
     pct = max(high_change, low_change)
     if pct < IMPULSO_5M_PCT:
         return
+
+    # Guardamos que ya alertamos esta vela
+    ultimo_timestamp_impulso = clave_vela
 
     direccion = "ALCISTA" if high_change >= low_change else "BAJISTA"
     emoji = "🟢" if direccion == "ALCISTA" else "🔴"

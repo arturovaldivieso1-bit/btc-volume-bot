@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os   # <-- necesario para os.getenv()
+import os
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║   CONFIGURACIÓN – MODIFICA SOLO ESTE BLOQUE            ║
@@ -46,7 +46,7 @@ import atexit
 # =========================
 ultima_deriva_time     = None
 ultimo_precio_deriva   = None
-ultimo_precio_resumen  = None   # para filtrar resúmenes con poca variación
+ultimo_precio_resumen  = None
 last_heartbeat         = None
 last_resumen           = None
 memoria_niveles        = {}
@@ -248,13 +248,28 @@ def dias_en_rango_actual(df_1h, precio):
     return dias, min_rango, max_rango
 
 # =========================
-# ALERTAS
+# ALERTA DE IMPULSO (CORREGIDA)
 # =========================
 def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
     if df_5m.empty or len(df_5m) < 2:
         return
-    vela = df_5m.iloc[-1]
-    open_, high, low, close, vol = vela["open"], vela["high"], vela["low"], vela["close"], vela["volume"]
+
+    ahora = datetime.now(UTC)
+    ultima_vela = df_5m.iloc[-1]
+    # El timestamp de apertura + 5 minutos = hora esperada de cierre
+    cierre_teorico = ultima_vela["time_dt"] + timedelta(minutes=5)
+
+    # Si todavía no ha llegado la hora de cierre, la vela está en formación → tomamos la anterior
+    if ahora < cierre_teorico:
+        if len(df_5m) < 3:
+            return
+        vela = df_5m.iloc[-2]
+    else:
+        vela = ultima_vela
+
+    open_, high, low, close, vol = (
+        vela["open"], vela["high"], vela["low"], vela["close"], vela["volume"]
+    )
     high_change = (high - open_) / open_ * 100
     low_change  = (open_ - low)  / open_ * 100
     pct = max(high_change, low_change)
@@ -279,6 +294,9 @@ def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
            f"Volumen: {vol:.0f} BTC ({conf})\n"
            f"Sesgo: {sesgo}{nivel_txt}")
 
+# =========================
+# RESTO DE ALERTAS
+# =========================
 def alerta_nivel(precio, nivel, tipo_nivel, df_1h):
     global ultima_alerta_global
     ahora = datetime.now(UTC).replace(tzinfo=None)
@@ -369,7 +387,7 @@ def deriva_silenciosa(precio, ahora):
         ultimo_precio_deriva = precio
 
 # =========================
-# RESUMEN HORARIO (ahora cada 4h y solo si variación ≥ 0.3%)
+# RESUMEN HORARIO
 # =========================
 def resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivotes_l):
     ahora = datetime.now(UTC).replace(tzinfo=None)
@@ -461,7 +479,7 @@ def main():
             alerta_ruptura_rango(df_1h, precio, pivotes_h, pivotes_l)
             deriva_silenciosa(precio, ahora_utc)
 
-            # --- NUEVO: resumen cada 4h y solo si hubo variación ≥ 0.3% desde el último ---
+            # Resumen cada 4h y solo si variación ≥ 0.3%
             if last_resumen is None or (
                 (ahora_naive - last_resumen) > timedelta(hours=4) and
                 (ultimo_precio_resumen is None or 

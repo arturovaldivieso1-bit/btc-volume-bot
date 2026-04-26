@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os   # <-- IMPRESCINDIBLE: lo usamos en la línea siguiente
+import os   # <-- necesario para os.getenv()
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║   CONFIGURACIÓN – MODIFICA SOLO ESTE BLOQUE            ║
@@ -42,10 +42,11 @@ from concurrent.futures import ThreadPoolExecutor
 import atexit
 
 # =========================
-# ESTADO GLOBAL (NO MODIFICAR)
+# ESTADO GLOBAL
 # =========================
 ultima_deriva_time     = None
 ultimo_precio_deriva   = None
+ultimo_precio_resumen  = None   # para filtrar resúmenes con poca variación
 last_heartbeat         = None
 last_resumen           = None
 memoria_niveles        = {}
@@ -368,7 +369,7 @@ def deriva_silenciosa(precio, ahora):
         ultimo_precio_deriva = precio
 
 # =========================
-# RESUMEN HORARIO
+# RESUMEN HORARIO (ahora cada 4h y solo si variación ≥ 0.3%)
 # =========================
 def resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivotes_l):
     ahora = datetime.now(UTC).replace(tzinfo=None)
@@ -408,7 +409,7 @@ def resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivot
 # BUCLE PRINCIPAL
 # =========================
 def main():
-    global last_resumen, last_heartbeat, memoria_niveles
+    global last_resumen, last_heartbeat, memoria_niveles, ultimo_precio_resumen
 
     memoria_niveles = cargar_memoria()
     precio = precio_actual()
@@ -425,7 +426,6 @@ def main():
             ahora_utc = datetime.now(UTC)
             ahora_naive = ahora_utc.replace(tzinfo=None)
 
-            # Usamos FETCH_1H_LIMIT para el bucle también
             df_1h = obtener_candles(INTERVAL_1H, FETCH_1H_LIMIT)
             df_4h = obtener_candles(INTERVAL_4H, 100)
             df_5m = obtener_candles(INTERVAL_5M, 100)
@@ -461,10 +461,17 @@ def main():
             alerta_ruptura_rango(df_1h, precio, pivotes_h, pivotes_l)
             deriva_silenciosa(precio, ahora_utc)
 
-            if last_resumen is None or (ahora_naive - last_resumen) > timedelta(hours=1):
+            # --- NUEVO: resumen cada 4h y solo si hubo variación ≥ 0.3% desde el último ---
+            if last_resumen is None or (
+                (ahora_naive - last_resumen) > timedelta(hours=4) and
+                (ultimo_precio_resumen is None or 
+                 abs(precio - ultimo_precio_resumen) / ultimo_precio_resumen >= 0.003)
+            ):
                 resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivotes_l)
                 last_resumen = ahora_naive
+                ultimo_precio_resumen = precio
 
+            # Heartbeat cada 4h
             if last_heartbeat and (ahora_naive - last_heartbeat) > timedelta(hours=4):
                 enviar(f"⏱️ Bot V14 activo — {fmt(precio)} USD — {datetime.now(UTC).strftime('%H:%M')} UTC")
                 last_heartbeat = ahora_naive

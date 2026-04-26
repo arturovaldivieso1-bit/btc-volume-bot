@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║   CONFIGURACIÓN – MODIFICA SOLO ESTE BLOQUE            ║
-# ╚══════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════╗
+# ║       CONFIGURACIÓN – MODIFICA SOLO ESTE BLOQUE            ║
+# ╚══════════════════════════════════════════════════════════════╝
 TOKEN       = os.getenv("TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
 SYMBOL      = "BTCUSDT"
@@ -14,21 +14,21 @@ INTERVAL_5M = "5m"
 
 # --- Niveles (soportes / resistencias) ---
 LOOKBACK_PIVOTS       = 672      # velas 1h analizadas (4 semanas ≈ 672h)
-FETCH_1H_LIMIT        = 720      # velas 1h que se piden a Binance (debe ser ≥ LOOKBACK_PIVOTS + 50)
+FETCH_1H_LIMIT        = 720      # velas 1h que se piden a Binance (≥ LOOKBACK_PIVOTS + 50)
 TOP_NIVELES           = 5        # cuántos máximos/mínimos se guardan como referencia
 AGRUPACION_NIVELES    = 200      # redondeo para unificar niveles cercanos (200 = 200 USD)
 PROXIMIDAD_NIVEL      = 0.001    # % que define "tocar" un nivel (0.001 = 0.1%)
 
 # --- Alertas de precio ---
 IMPULSO_5M_PCT        = 0.65     # % mínimo de mecha/cuerpo en vela 5m para avisar
-MOVIMIENTO_BRUSCO_PCT = 1.5      # % mínimo de variación en 1h para considerar "movimiento brusco"
-DIAS_ESTRECHO_MIN     = 3        # días consecutivos de rango pequeño para alerta
+MOVIMIENTO_BRUSCO_PCT = 1.0      # % mínimo de variación en 1h para avisar (antes 1.5)
+DIAS_ESTRECHO_MIN     = 3        # días consecutivos de rango pequeño (solo informativo)
 
 # --- Archivo de memoria ---
 MEMORIA_NIVELES_FILE  = "memoria_niveles.json"
-# ╔══════════════════════════════════════════════════════════╗
-# ║   FIN DE CONFIGURACIÓN – NO TOCAR MÁS ABAJO           ║
-# ╚══════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════╗
+# ║       FIN DE CONFIGURACIÓN – NO TOCAR MÁS ABAJO            ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 import requests
 import pandas as pd
@@ -46,7 +46,7 @@ import atexit
 # =========================
 ultima_deriva_time     = None
 ultimo_precio_deriva   = None
-ultimo_precio_resumen  = None
+ultimo_precio_resumen  = None      # ya casi no se usa, se mantiene por si algún día reactivas el resumen
 last_heartbeat         = None
 last_resumen           = None
 memoria_niveles        = {}
@@ -221,45 +221,18 @@ def calcular_sesgo(df_1h, precio):
         return "BAJISTA"
     return "LATERAL"
 
-def dias_en_rango_actual(df_1h, precio):
-    if df_1h.empty or len(df_1h) < 48:
-        return 0, 0, 0
-    rangos_diarios = []
-    for i in range(10):
-        seg = df_1h.iloc[-(24*(i+1)):-(24*i) if i > 0 else len(df_1h)]
-        if len(seg) >= 12:
-            r = (seg["high"].max() - seg["low"].min()) / precio
-            rangos_diarios.append(r)
-    if not rangos_diarios:
-        return 0, 0, 0
-    umbral = np.mean(rangos_diarios) * 0.5
-    dias = 0
-    for i in range(1, min(15, len(df_1h) // 24) + 1):
-        seg = df_1h.iloc[-24*i:-24*(i-1) if i > 1 else len(df_1h)]
-        if len(seg) < 12:
-            continue
-        rango_dia = (seg["high"].max() - seg["low"].min()) / precio
-        if rango_dia < umbral:
-            dias += 1
-        else:
-            break
-    min_rango = df_1h["low"].tail(24 * max(dias, 1)).min()
-    max_rango = df_1h["high"].tail(24 * max(dias, 1)).max()
-    return dias, min_rango, max_rango
-
 # =========================
-# ALERTA DE IMPULSO (CORREGIDA)
+# ALERTA DE IMPULSO (VELA CERRADA)
 # =========================
 def alerta_impulso_vela(df_5m, precio, pivotes_sop, pivotes_res, sesgo):
     if df_5m.empty or len(df_5m) < 2:
         return
 
-    ahora = datetime.now(UTC)
+    ahora = datetime.now(UTC).replace(tzinfo=None)
     ultima_vela = df_5m.iloc[-1]
-    # El timestamp de apertura + 5 minutos = hora esperada de cierre
     cierre_teorico = ultima_vela["time_dt"] + timedelta(minutes=5)
 
-    # Si todavía no ha llegado la hora de cierre, la vela está en formación → tomamos la anterior
+    # Si la última vela todavía se está formando, analizamos la anterior (ya cerrada)
     if ahora < cierre_teorico:
         if len(df_5m) < 3:
             return
@@ -326,19 +299,11 @@ def alerta_movimiento_brusco(precio, df_1h):
     if var < MOVIMIENTO_BRUSCO_PCT:
         return
     direccion = "ALZA" if precio > precio_anterior else "BAJA"
-    if direccion in ultima_alerta_brusco and (ahora - ultima_alerta_brusco[direccion]) < timedelta(hours=4):
+    if direccion in ultima_alerta_brusco and (ahora - ultima_alerta_brusco[direccion]) < timedelta(minutes=30):
         return
     ultima_alerta_brusco[direccion] = ahora
     emoji = "🔥" if direccion == "ALZA" else "❄️"
-    variaciones = []
-    for i in range(2, min(25, len(df_1h))):
-        var_i = (df_1h["close"].iloc[-i] - df_1h["close"].iloc[-i-1]) / df_1h["close"].iloc[-i-1] * 100
-        if (var_i > 0 and direccion == "ALZA") or (var_i < 0 and direccion == "BAJA"):
-            variaciones.append(abs(var_i))
-    extra = ""
-    if variaciones and var > max(variaciones):
-        extra = f" — mayor movimiento en {len(variaciones)} horas"
-    enviar(f"{emoji} Movimiento brusco: {direccion} {var:.2f}% en 1h{extra}\n"
+    enviar(f"{emoji} Movimiento brusco: {direccion} {var:.2f}% en 1h\n"
            f"De {fmt(precio_anterior)} → {fmt(precio)}\n"
            f"{datetime.now(UTC).strftime('%H:%M')} UTC")
 
@@ -385,43 +350,6 @@ def deriva_silenciosa(precio, ahora):
                        f"{ahora.strftime('%H:%M')} UTC")
         ultima_deriva_time = ahora_naive
         ultimo_precio_deriva = precio
-
-# =========================
-# RESUMEN HORARIO
-# =========================
-def resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivotes_l):
-    ahora = datetime.now(UTC).replace(tzinfo=None)
-    var1h = (precio - df_1h["close"].iloc[-2]) / df_1h["close"].iloc[-2] * 100 if len(df_1h) >= 2 else 0
-    var24h = (precio - df_1h["close"].iloc[-25]) / df_1h["close"].iloc[-25] * 100 if len(df_1h) >= 25 else 0
-    var7d = (precio - df_1h["close"].iloc[-169]) / df_1h["close"].iloc[-169] * 100 if len(df_1h) >= 169 else 0
-
-    rango_min = df_1h["low"].tail(24).min()
-    rango_max = df_1h["high"].tail(24).max()
-    rango = rango_max - rango_min
-
-    sesgo = calcular_sesgo(df_1h, precio)
-
-    soporte_txt = f"{fmt(soporte)} ({abs(soporte-precio)/precio*100:.2f}%) — {obtener_contexto_nivel(soporte, precio, df_1h)}" if soporte else "sin soporte claro"
-    resistencia_txt = f"{fmt(resistencia)} ({abs(resistencia-precio)/precio*100:.2f}%) — {obtener_contexto_nivel(resistencia, precio, df_1h)}" if resistencia else "sin resistencia clara"
-
-    dias_rango, min_r, max_r = dias_en_rango_actual(df_1h, precio)
-
-    msg = (f"📍 CONTEXTO ACTUAL — {datetime.now(UTC).strftime('%H:%M')} UTC\n"
-           f"Precio: {fmt(precio)}\n"
-           f"📊 Variación: {var1h:+.2f}% (1h) | {var24h:+.2f}% (24h) | {var7d:+.2f}% (7d)\n"
-           f"🛡️ Soporte: {soporte_txt}\n"
-           f"🚀 Resistencia: {resistencia_txt}\n"
-           f"📐 Rango 24h: {fmt(rango_min)} – {fmt(rango_max)} ({rango:.0f} USD)\n"
-           f"📈 Sesgo: {sesgo}")
-
-    if not df_oi.empty and len(df_oi) >= 288:
-        oi_var = (df_oi["sumOpenInterestValue"].iloc[-1] - df_oi["sumOpenInterestValue"].iloc[-288]) / df_oi["sumOpenInterestValue"].iloc[-288] * 100
-        msg += f"\n{'📈' if oi_var > 0 else '📉'} OI Futuros (24h): {oi_var:+.2f}%"
-
-    if dias_rango >= DIAS_ESTRECHO_MIN:
-        msg += f"\n⏳ Rango estrecho: {dias_rango} días ({fmt(min_r)} – {fmt(max_r)}) — posible explosión próxima"
-
-    enviar(msg)
 
 # =========================
 # BUCLE PRINCIPAL
@@ -479,19 +407,10 @@ def main():
             alerta_ruptura_rango(df_1h, precio, pivotes_h, pivotes_l)
             deriva_silenciosa(precio, ahora_utc)
 
-            # Resumen cada 4h y solo si variación ≥ 0.3%
-            if last_resumen is None or (
-                (ahora_naive - last_resumen) > timedelta(hours=4) and
-                (ultimo_precio_resumen is None or 
-                 abs(precio - ultimo_precio_resumen) / ultimo_precio_resumen >= 0.003)
-            ):
-                resumen_horario(precio, soporte, resistencia, df_1h, df_oi, pivotes_h, pivotes_l)
-                last_resumen = ahora_naive
-                ultimo_precio_resumen = precio
-
-            # Heartbeat cada 4h
-            if last_heartbeat and (ahora_naive - last_heartbeat) > timedelta(hours=4):
-                enviar(f"⏱️ Bot V14 activo — {fmt(precio)} USD — {datetime.now(UTC).strftime('%H:%M')} UTC")
+            # --- Heartbeat solo a las 9:00 y 16:00 Chile (UTC-4) ---
+            hora_chile = (ahora_utc - timedelta(hours=4)).strftime('%H:%M')
+            if hora_chile in ("09:00", "16:00") and (last_heartbeat is None or (ahora_naive - last_heartbeat) > timedelta(hours=1)):
+                enviar(f"⏱️ Bot V14 activo — {fmt(precio)} USD — {hora_chile} Chile")
                 last_heartbeat = ahora_naive
 
             time.sleep(45)
